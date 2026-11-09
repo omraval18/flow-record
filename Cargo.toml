@@ -1,0 +1,42 @@
+[package]
+name = "fr"
+version = "0.1.0"
+edition = "2021"
+description = "Record terminal commands once, replay them as parameterized workflows."
+license = "MIT"
+readme = "README.md"
+keywords = ["cli", "shell", "zsh", "workflow", "automation"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = [".github/", "install.sh"]
+
+[lib]
+name = "fr"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fr"
+path = "src/main.rs"
+
+[dependencies]
+crossterm = { version = "0.29", default-features = false, features = ["events"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+shlex = "1"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
