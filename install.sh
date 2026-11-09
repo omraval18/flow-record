@@ -2,16 +2,16 @@
 # Install fr: download the release binary for this machine, verify its checksum, and
 # put it on your PATH.
 #
-#   curl -fsSL https://raw.githubusercontent.com/OWNER/fr/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/omraval18/flow-record/main/install.sh | sh
 #
 # Environment:
 #   FR_INSTALL_DIR  where to put the binary           (default: ~/.local/bin)
 #   FR_VERSION      release tag to install, e.g. v0.1.0 (default: latest)
-#   FR_REPO         GitHub repository, owner/name      (default: OWNER/fr)
+#   FR_REPO         GitHub repository, owner/name      (default: omraval18/flow-record)
 #   FR_BASE_URL     override the download location (used by tests)
 set -eu
 
-REPO="${FR_REPO:-OWNER/fr}"
+REPO="${FR_REPO:-omraval18/flow-record}"
 INSTALL_DIR="${FR_INSTALL_DIR:-$HOME/.local/bin}"
 VERSION="${FR_VERSION:-latest}"
 
