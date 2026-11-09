@@ -1,5 +1,9 @@
 # fr
 
+[![CI](https://github.com/omraval18/flow-record/actions/workflows/ci.yml/badge.svg)](https://github.com/omraval18/flow-record/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/omraval18/flow-record)](https://github.com/omraval18/flow-record/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **Record terminal commands once, replay them as parameterized workflows.**
 
 Stop writing throwaway shell scripts. Run `fr`, do the thing once, run `fr` again — and
@@ -37,17 +41,42 @@ it as an argument. You answered two questions; there is no script to edit.
   globally. The same name can mean different things in different projects.
 - **Safe by default.** Failed commands are excluded, destructive steps need a typed
   confirmation, and a workflow arriving via `git pull` must be approved before it runs.
-- **Small and fast.** One ~700 KB binary, no runtime, startup in about a millisecond.
+- **Small and fast.** One 700–800 KB binary, no runtime, startup in about a millisecond.
+- **macOS and Linux**, on both arm64 and x86_64.
 
 ## Install
 
-**Prebuilt binary** (macOS and Linux, arm64 and x86_64):
+### 1. Install zsh (Linux only)
+
+fr runs in **zsh**. macOS ships with it; most Linux distributions need it installed:
+
+```sh
+sudo apt install zsh        # Debian / Ubuntu
+sudo dnf install zsh        # Fedora / RHEL
+sudo pacman -S zsh          # Arch
+```
+
+### 2. Install fr
+
+**Prebuilt binary** (recommended):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/omraval18/flow-record/main/install.sh | sh
 ```
 
-**From source** (needs a Rust toolchain):
+The script picks the right build for your machine, verifies its SHA-256 checksum and installs a
+single file to `~/.local/bin` (make sure that's on your `PATH`). Options:
+`FR_INSTALL_DIR=/usr/local/bin` to install elsewhere, `FR_VERSION=v0.1.1` to pin a version.
+
+| Platform | Build | Requirements |
+|---|---|---|
+| macOS, Apple silicon | `aarch64-apple-darwin` | |
+| macOS, Intel | `x86_64-apple-darwin` | |
+| Linux, x86_64 | `x86_64-unknown-linux-gnu` | glibc 2.34+ (Ubuntu 22.04+, Debian 12+, Fedora 35+, RHEL 9+) |
+| Linux, arm64 | `aarch64-unknown-linux-gnu` | glibc 2.34+ |
+
+Binaries are also on the [releases page](https://github.com/omraval18/flow-record/releases/latest).
+On older distributions, Alpine (musl), or anything else, build from source:
 
 ```sh
 cargo install --git https://github.com/omraval18/flow-record
@@ -55,13 +84,15 @@ cargo install --git https://github.com/omraval18/flow-record
 cargo install --path .
 ```
 
-**Then enable the shell integration** — add this to the end of `~/.zshrc`, after `compinit`:
+### 3. Enable the shell integration
+
+Add this to the end of `~/.zshrc`, after `compinit`:
 
 ```sh
 eval "$(fr init zsh)"
 ```
 
-Open a new terminal and run `fr --help`. Requires **zsh** (bash and fish are not supported yet).
+Open a new terminal and run `fr --help`. bash and fish are not supported yet.
 
 ## Usage
 
@@ -165,7 +196,7 @@ that aren't valid parameter names (Go templates like `{{.Names}}`) are left alon
 ## Development
 
 ```sh
-cargo test                                   # unit + end-to-end (real binary, real zsh/bash)
+cargo test                                   # unit + end-to-end (real binary, real zsh/bash; install zsh to run them all)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all
 ```
@@ -178,8 +209,9 @@ map.
 
 ## Status
 
-Early (v0.1). zsh only; macOS and Linux. Not yet: bash/fish, workflow sharing/import,
-secret redaction.
+Early: v0.1.1. Runs on macOS and Linux (arm64 and x86_64); CI tests every change on both,
+including real zsh sessions. zsh only for now. Not yet: bash/fish, a static musl Linux build,
+workflow sharing/import, secret redaction.
 
 ## License
 
