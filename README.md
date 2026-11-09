@@ -44,13 +44,13 @@ it as an argument. You answered two questions; there is no script to edit.
 **Prebuilt binary** (macOS and Linux, arm64 and x86_64):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/OWNER/fr/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/omraval18/flow-record/main/install.sh | sh
 ```
 
 **From source** (needs a Rust toolchain):
 
 ```sh
-cargo install --git https://github.com/OWNER/fr
+cargo install --git https://github.com/omraval18/flow-record
 # or, from a clone:
 cargo install --path .
 ```
