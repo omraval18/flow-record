@@ -58,7 +58,7 @@ expected="$(cut -d ' ' -f 1 "$tmp/$archive.sha256")"
 actual="$(sha256 "$tmp/$archive")"
 [ "$expected" = "$actual" ] || die "checksum mismatch (expected $expected, got $actual)"
 
-tar -xzf "$tmp/$archive" -C "$tmp"
+tar -xzf "$tmp/$archive" -C "$tmp" fr
 mkdir -p "$INSTALL_DIR"
 install -m 0755 "$tmp/fr" "$INSTALL_DIR/fr"
 
