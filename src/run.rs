@@ -238,7 +238,10 @@ fn evaluate(
     // An assignment's status is that of its last command substitution, so a failing
     // command fails the expansion instead of silently yielding "".
     let (program, script) = match dialect {
-        Dialect::Posix => ("sh", format!("__fr_v=\"{expr}\" && printf '%s' \"$__fr_v\"")),
+        Dialect::Posix => (
+            "sh",
+            format!("__fr_v=\"{expr}\" && printf '%s' \"$__fr_v\""),
+        ),
         Dialect::Fish => (
             "fish",
             format!("set -l __fr_v \"{expr}\"; and printf '%s' \"$__fr_v\""),
