@@ -32,6 +32,26 @@ $ fr next my-new-app                    # later, in any terminal
 `zustand` appeared once, so it stays constant. `dashboard` appeared twice, so you were offered
 it as an argument. You answered two questions; there is no script to edit.
 
+**Full documentation:** [docs/reference.md](docs/reference.md) covers every command, flag,
+file field and setting. Changes are listed in [CHANGELOG.md](CHANGELOG.md).
+
+## Features
+
+| | |
+|---|---|
+| **Record** | `fr` … `fr` captures commands as typed; failed ones are dropped, repeated values become arguments. |
+| **Save after the fact** | `fr save [n]` turns commands you already ran into a workflow. |
+| **Learn your habits** | `fr suggest` finds sequences you typed 3+ times; values that changed become arguments. |
+| **Replay in your shell** | `cd`, `export`, `source` persist; steps land in shell history; prefixes and `<TAB>` ranking. |
+| **Arguments** | Positional or prompted, defaults, computed defaults (`$(…)`), restricted choices with a picker. |
+| **Steps** | Multi-line, may-fail steps (`-cmd`), workflows calling workflows. |
+| **Recover** | `fr resume` continues from the failed step with the same values; `--from <n>`. |
+| **Shims** | `fr shim next` → type `next my-app`. |
+| **Projects & teams** | Per-repo `.fr/` workflows shadow global ones; commit them to share. |
+| **Safety** | Trust-on-first-use for project workflows, typed confirmation for destructive steps, dry runs. |
+| **Edit & export** | Interactive `fr edit`, raw `fr edit -e`, portable bash via `fr export`. |
+| **Shells** | zsh, bash 3.2+, fish 3.1+, on macOS and Linux. |
+
 ## Why fr
 
 - **Replay happens in your shell, not a subprocess.** `cd`, `export` and `source` persist
@@ -98,6 +118,8 @@ has to run inside your shell), completion, the recording indicator and the histo
 
 ## Usage
 
+A tour of the everyday commands; the [reference](docs/reference.md) has every option.
+
 ### Create
 
 | | |
@@ -154,6 +176,10 @@ when a shim hides a real command.
 | `fr rm <name>` | Delete |
 | `fr export <name>` | Print a standalone bash script; parameters become positional arguments |
 | `fr shim [name…]` / `fr unshim <name…>` | Run workflows without the `fr` prefix |
+
+Inside `fr edit`: **parameters** → `add`, `rename`, `default`, `choices`, `constant`;
+**steps** → `rm`, `mv`, `set`, `fail` (toggle allowed-to-fail). See
+[Editing](docs/reference.md#editing).
 
 ## Scopes
 
