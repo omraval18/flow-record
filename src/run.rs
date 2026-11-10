@@ -2,17 +2,23 @@
 //! confirmations that apply, and emit one script for the shell function to `eval`.
 //!
 //! The script goes to `out` (stdout); everything for the human goes through the [`Ui`]
-//! (stderr), so `$(fr _run …)` captures only the script.
+//! (stderr), so `$(fr _exec …)` captures only the script.
 
 use crate::destructive::is_destructive;
+use crate::render::{self, Dialect, Rendered, Script};
+use crate::shell::Shell;
 use crate::store::{self, Entry, Resolution, Store};
 use crate::ui::{tilde, Ui};
-use crate::workflow::{Param, Scope, Workflow};
-use crate::{render, Error, Result};
+use crate::workflow::{split_optional, Param, Scope, Workflow};
+use crate::{Error, Result};
 use std::collections::HashMap;
 use std::io::Write;
+use std::process::{Command, Stdio};
 
-const USAGE: &str = "usage: fr [-n] [-y] [-g|-p] <workflow> [args…]";
+const USAGE: &str = "usage: fr [-n] [-y] [-g|-p] [--from <step>] <workflow> [args…]";
+
+/// Workflows may run other workflows; deeper than this is almost certainly a loop.
+pub const MAX_DEPTH: u32 = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Options {
@@ -21,8 +27,16 @@ pub struct Options {
     /// Skip the destructive-step confirmation (never the untrusted-workflow one).
     pub yes: bool,
     pub scope: Option<Scope>,
+    /// Start at this 1-based step (resuming after a failure).
+    pub from: Option<usize>,
     pub name: String,
     pub args: Vec<String>,
+    /// The shell that will `eval` the script.
+    pub shell: Shell,
+    /// Emit `__fr_remember` calls so replayed steps land in the shell's history.
+    pub remember: bool,
+    /// How many workflows are already running around this one.
+    pub depth: u32,
 }
 
 impl Options {
@@ -32,6 +46,7 @@ impl Options {
         let mut options = Self::default();
         let mut rest = args;
         while let Some((flag, tail)) = rest.split_first() {
+            let mut next = tail;
             let scope = match flag.as_str() {
                 "-n" | "--dry-run" => {
                     options.dry_run = true;
@@ -43,6 +58,18 @@ impl Options {
                 }
                 "-g" | "--global" => Some(Scope::Global),
                 "-p" | "--project" => Some(Scope::Project),
+                "--from" => {
+                    let (value, after) = tail.split_first().ok_or_else(|| {
+                        Error::usage(format!("--from needs a step number\n{USAGE}"))
+                    })?;
+                    options.from = Some(parse_step(value)?);
+                    next = after;
+                    None
+                }
+                f if f.starts_with("--from=") => {
+                    options.from = Some(parse_step(&f["--from=".len()..])?);
+                    None
+                }
                 f if f.len() > 1 && f.starts_with('-') => {
                     return Err(Error::usage(format!("unknown flag `{f}`\n{USAGE}")))
                 }
@@ -56,13 +83,21 @@ impl Options {
                 }
                 options.scope = Some(scope);
             }
-            rest = tail;
+            rest = next;
         }
         let (name, args) = rest.split_first().ok_or_else(|| Error::usage(USAGE))?;
         options.name.clone_from(name);
         options.args = args.to_vec();
         Ok(options)
     }
+}
+
+fn parse_step(value: &str) -> Result<usize> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|&n| n >= 1)
+        .ok_or_else(|| Error::usage(format!("`{value}` is not a step number")))
 }
 
 /// A resolved workflow and how it was found.
@@ -129,11 +164,13 @@ fn pick_one(ui: &mut dyn Ui, mut candidates: Vec<Entry>, input: &str) -> Result<
     }
 }
 
-/// Argument values by parameter name; `None` marks a value still unknown (dry run only).
+/// Argument values by parameter name; `None` marks a value still unknown (a dry run, or a
+/// computed default not yet run).
 pub type Bound = HashMap<String, Option<String>>;
 
-/// Match positional `args` to the workflow's parameters. For a required parameter with
-/// no argument, `missing` decides: prompt (`Some`) or leave it pending (`None`).
+/// Match positional `args` to the workflow's parameters. Arguments are checked against
+/// `choices`; computed defaults are left `None` for [`compute_defaults`]. For a required
+/// parameter with no argument, `missing` decides: prompt (`Some`) or leave it pending.
 pub fn bind(
     workflow: &Workflow,
     name: &str,
@@ -151,7 +188,11 @@ pub fn bind(
     let mut bound = Bound::with_capacity(workflow.params.len());
     for (i, param) in workflow.params.iter().enumerate() {
         let value = match (args.get(i), &param.default) {
-            (Some(arg), _) => Some(arg.clone()),
+            (Some(arg), _) => {
+                param.accepts(arg)?;
+                Some(arg.clone())
+            }
+            (None, Some(_)) if param.computed_default().is_some() => None,
             (None, Some(default)) => Some(default.clone()),
             (None, None) => missing(param)?,
         };
@@ -160,23 +201,87 @@ pub fn bind(
     Ok(bound)
 }
 
+/// Run each computed default (`$(…)`) that no argument replaced, in a child shell in the
+/// workflow's directory, and check the result against the parameter's choices.
+pub fn compute_defaults(
+    workflow: &Workflow,
+    bound: &mut Bound,
+    cwd: &std::path::Path,
+) -> Result<Vec<(String, String)>> {
+    let mut computed = Vec::new();
+    for param in &workflow.params {
+        let Some(expr) = param.computed_default() else {
+            continue;
+        };
+        if bound.get(&param.name).is_some_and(Option::is_some) {
+            continue;
+        }
+        let value = evaluate(workflow.shell, expr, cwd).map_err(|why| {
+            Error::invalid(format!(
+                "could not compute the default of `{}` ({expr}): {why}",
+                param.name
+            ))
+        })?;
+        param.accepts(&value)?;
+        bound.insert(param.name.clone(), Some(value.clone()));
+        computed.push((param.name.clone(), value));
+    }
+    Ok(computed)
+}
+
+/// Expand `expr` as the inside of a double-quoted shell word and return the result.
+fn evaluate(
+    dialect: Dialect,
+    expr: &str,
+    cwd: &std::path::Path,
+) -> std::result::Result<String, String> {
+    // An assignment's status is that of its last command substitution, so a failing
+    // command fails the expansion instead of silently yielding "".
+    let (program, script) = match dialect {
+        Dialect::Posix => ("sh", format!("__fr_v=\"{expr}\" && printf '%s' \"$__fr_v\"")),
+        Dialect::Fish => (
+            "fish",
+            format!("set -l __fr_v \"{expr}\"; and printf '%s' \"$__fr_v\""),
+        ),
+    };
+    let output = Command::new(program)
+        .args(["-c", &script])
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stderr(Stdio::inherit())
+        .output()
+        .map_err(|e| format!("cannot start {program}: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("it exited with {}", output.status));
+    }
+    String::from_utf8(output.stdout).map_err(|_| "the output is not UTF-8".to_owned())
+}
+
 /// Render every step. Pending values appear as `<name>` for previews.
-fn render_steps(workflow: &Workflow, bound: &Bound) -> Vec<String> {
+fn render_steps(workflow: &Workflow, bound: &Bound) -> Vec<Rendered> {
+    let dialect = workflow.shell;
     workflow
         .steps
         .iter()
         .map(|step| {
-            render::substitute(step, |name, ctx| {
-                Some(match bound.get(name)? {
-                    Some(value) => render::quote(value, ctx).into_owned(),
-                    None => format!("<{name}>"),
-                })
-            })
+            let (optional, command) = split_optional(step);
+            Rendered {
+                optional,
+                text: render::substitute_in(dialect, command, |name, ctx| {
+                    Some(match bound.get(name)? {
+                        Some(value) => render::quote_in(dialect, value, ctx).into_owned(),
+                        None => format!("<{name}>"),
+                    })
+                }),
+            }
         })
         .collect()
 }
 
 fn ask_required(ui: &mut dyn Ui, param: &Param) -> Result<String> {
+    if !param.choices.is_empty() {
+        return ask_choice(ui, param);
+    }
     let hint = param
         .example
         .as_ref()
@@ -190,27 +295,66 @@ fn ask_required(ui: &mut dyn Ui, param: &Param) -> Result<String> {
     }
 }
 
-fn preview(ui: &mut dyn Ui, entry: &Entry, by_prefix: bool, steps: &[String]) {
+/// Offer a parameter's choices as a numbered list; a number or the value itself answers.
+fn ask_choice(ui: &mut dyn Ui, param: &Param) -> Result<String> {
+    let pal = ui.pal();
+    let row: Vec<String> = param
+        .choices
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("{} {c}", pal.cyan(&(i + 1).to_string())))
+        .collect();
+    ui.say(&format!("    {}", row.join("   ")));
+    let hint = format!("1-{}", param.choices.len());
+    loop {
+        let answer = ui.ask(&param.name, &hint)?;
+        let answer = answer.trim();
+        let by_number = answer
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| n.checked_sub(1))
+            .and_then(|i| param.choices.get(i));
+        if let Some(choice) = by_number.or_else(|| param.choices.iter().find(|c| *c == answer)) {
+            return Ok(choice.clone());
+        }
+        ui.say(&format!(
+            "  {}",
+            pal.yellow(&format!("choose one of: {}", param.choices.join(", ")))
+        ));
+    }
+}
+
+fn preview(ui: &mut dyn Ui, entry: &Entry, by_prefix: bool, first: usize, steps: &[Rendered]) {
     let pal = ui.pal();
     let how = if by_prefix {
         pal.dim("  · matched by prefix")
     } else {
         String::new()
     };
+    let resuming = if first > 1 {
+        pal.dim(&format!("  · from step {first}"))
+    } else {
+        String::new()
+    };
     ui.say(&format!(
-        "\n  {} {}  {}{how}",
+        "\n  {} {}  {}{how}{resuming}",
         pal.green("▶"),
         pal.bold(&entry.name),
         pal.dim(entry.scope.label())
     ));
     for (i, step) in steps.iter().enumerate() {
-        for (line_no, line) in step.lines().enumerate() {
+        for (line_no, line) in step.text.lines().enumerate() {
             let num = if line_no == 0 {
-                format!("{:>2}", i + 1)
+                format!("{:>2}", first + i)
             } else {
                 "  ".to_owned()
             };
-            ui.say(&format!("    {}  {line}", pal.dim(&num)));
+            let tag = if line_no == 0 && step.optional {
+                format!("  {}", pal.dim("may fail"))
+            } else {
+                String::new()
+            };
+            ui.say(&format!("    {}  {line}{tag}", pal.dim(&num)));
         }
     }
     ui.say("");
@@ -218,13 +362,42 @@ fn preview(ui: &mut dyn Ui, entry: &Entry, by_prefix: bool, steps: &[String]) {
 
 /// Run a workflow: write its script to `out` once everything has been confirmed.
 pub fn run(store: &Store, ui: &mut dyn Ui, options: &Options, out: &mut dyn Write) -> Result<()> {
+    if options.depth > MAX_DEPTH {
+        return Err(Error::invalid(format!(
+            "workflows are nested more than {MAX_DEPTH} deep — does `{}` run itself?",
+            options.name
+        )));
+    }
     let Located { entry, by_prefix } = locate(store, ui, &options.name, options.scope)?;
     let workflow = store::load(&entry.path)?;
     workflow
         .validate()
         .map_err(|e| Error::invalid(format!("{e} — try `fr edit {}`", entry.name)))?;
+    let dialect = options.shell.dialect();
+    if workflow.shell != dialect {
+        let written = if workflow.shell == Dialect::Fish {
+            "fish"
+        } else {
+            "zsh/bash"
+        };
+        return Err(Error::invalid(format!(
+            "`{}` was recorded in {written} and cannot run in {}",
+            entry.name, options.shell
+        )));
+    }
 
-    let destructive = workflow.steps.iter().any(|s| is_destructive(s));
+    let total = workflow.steps.len();
+    let first = options.from.unwrap_or(1);
+    if first > total {
+        return Err(Error::usage(format!(
+            "`{}` has {total} step(s); --from {first} is past the end",
+            entry.name
+        )));
+    }
+
+    let destructive = workflow.steps[first - 1..]
+        .iter()
+        .any(|s| is_destructive(split_optional(s).1));
     if by_prefix && destructive {
         return Err(Error::invalid(format!(
             "`{}` is destructive — type its full name: fr {}",
@@ -232,21 +405,39 @@ pub fn run(store: &Store, ui: &mut dyn Ui, options: &Options, out: &mut dyn Writ
         )));
     }
 
-    let bound = bind(&workflow, &entry.name, &options.args, |param| {
+    let mut bound = bind(&workflow, &entry.name, &options.args, |param| {
         if options.dry_run {
             Ok(None)
         } else {
             ask_required(ui, param).map(Some)
         }
     })?;
-    let steps = render_steps(&workflow, &bound);
-    preview(ui, &entry, by_prefix, &steps);
-    if options.dry_run {
-        return Ok(());
-    }
-
     let pal = ui.pal();
-    if entry.scope == Scope::Project && !store.is_trusted(&entry.path) {
+    let trusted = entry.scope == Scope::Global || store.is_trusted(&entry.path);
+
+    if options.dry_run || !trusted {
+        // Computed defaults run code, so they wait until the workflow is approved.
+        preview(
+            ui,
+            &entry,
+            by_prefix,
+            first,
+            &render_steps(&workflow, &bound)[first - 1..],
+        );
+        for p in &workflow.params {
+            if let (Some(expr), None) = (
+                p.computed_default(),
+                bound.get(&p.name).and_then(Option::as_ref),
+            ) {
+                ui.say(&format!(
+                    "    {}",
+                    pal.dim(&format!("{} = {expr}  (computed when run)", p.name))
+                ));
+            }
+        }
+        if options.dry_run {
+            return Ok(());
+        }
         ui.say(&format!(
             "  {} New or changed project workflow",
             pal.yellow("!")
@@ -256,7 +447,21 @@ pub fn run(store: &Store, ui: &mut dyn Ui, options: &Options, out: &mut dyn Writ
             return Err(Error::Cancelled);
         }
         store.trust(&entry.path)?;
+        for (name, value) in compute_defaults(&workflow, &mut bound, store.cwd())? {
+            ui.say(&format!("    {}", pal.dim(&format!("{name} = {value}"))));
+        }
+    } else {
+        compute_defaults(&workflow, &mut bound, store.cwd())?;
+        preview(
+            ui,
+            &entry,
+            by_prefix,
+            first,
+            &render_steps(&workflow, &bound)[first - 1..],
+        );
     }
+    let steps = render_steps(&workflow, &bound);
+
     if destructive && !options.yes {
         ui.say(&format!("  {} Destructive steps detected", pal.yellow("!")));
         if ui
@@ -268,9 +473,33 @@ pub fn run(store: &Store, ui: &mut dyn Ui, options: &Options, out: &mut dyn Writ
         }
     }
 
+    // Everything `fr resume` needs to run the rest with the very same values.
+    let mut resume = vec![
+        match entry.scope {
+            Scope::Project => "-p",
+            Scope::Global => "-g",
+        }
+        .to_owned(),
+        entry.name.clone(),
+    ];
+    resume.extend(
+        workflow
+            .params
+            .iter()
+            .filter_map(|p| bound.get(&p.name).cloned().flatten()),
+    );
+
     // Ranking is a convenience; an unwritable state directory must not block the run.
     let _ = store.record_use(&entry.name);
-    out.write_all(render::chain(&steps).as_bytes())?;
+    let script = Script {
+        dialect,
+        steps: &steps[first - 1..],
+        first,
+        total,
+        resume: Some(&resume),
+        remember: options.remember,
+    };
+    out.write_all(script.render().as_bytes())?;
     Ok(())
 }
 
@@ -293,7 +522,7 @@ mod tests {
                 .map(|&(name, default)| Param {
                     name: name.into(),
                     default: default.map(Into::into),
-                    example: None,
+                    ..Param::default()
                 })
                 .collect(),
         )
@@ -314,10 +543,10 @@ mod tests {
             o,
             Options {
                 dry_run: true,
-                yes: false,
                 scope: Some(Scope::Global),
                 name: "deploy".into(),
-                args: strings(&["-x", "--force"])
+                args: strings(&["-x", "--force"]),
+                ..Options::default()
             }
         );
     }
@@ -384,10 +613,11 @@ mod tests {
     fn pending_values_preview_as_angle_brackets_without_quoting() {
         let wf = workflow(&["mkdir {{name}}", "echo \"{{name}}\""], &[("name", None)]);
         let bound = bind(&wf, "w", &[], |_| Ok(None)).unwrap();
-        assert_eq!(
-            render_steps(&wf, &bound),
-            ["mkdir <name>", "echo \"<name>\""]
-        );
+        let texts: Vec<String> = render_steps(&wf, &bound)
+            .into_iter()
+            .map(|r| r.text)
+            .collect();
+        assert_eq!(texts, ["mkdir <name>", "echo \"<name>\""]);
     }
 
     // ---- the full run -----------------------------------------------------------------
@@ -567,6 +797,152 @@ mod tests {
             &["-y", "build"],
         );
         assert!(matches!(result, Err(Error::Cancelled)));
+    }
+
+    fn param(name: &str, default: Option<&str>, choices: &[&str]) -> Param {
+        Param {
+            name: name.into(),
+            default: default.map(Into::into),
+            choices: strings(choices),
+            ..Param::default()
+        }
+    }
+
+    #[test]
+    fn computed_defaults_never_run_in_a_dry_run_or_before_a_project_workflow_is_approved() {
+        let fx = Fixture::new();
+        let wf = Workflow::new(
+            String::new(),
+            strings(&["echo {{tag}}"]),
+            vec![param("tag", Some("$(touch ran && echo v9)"), &[])],
+        );
+        fx.put_workflow("repo/.fr/workflows", "tagit", &wf);
+        let store = fx.store_in("repo");
+        let ran = fx.path("repo/ran");
+
+        let mut ui = Scripted::new([]);
+        assert_eq!(run_script(&store, &mut ui, &["-n", "tagit"]).unwrap(), "");
+        assert!(ui
+            .transcript()
+            .contains("tag = $(touch ran && echo v9)  (computed when run)"));
+        assert!(matches!(
+            run_script(&store, &mut Scripted::new([text("n")]), &["tagit"]),
+            Err(Error::Cancelled)
+        ));
+        assert!(!ran.exists(), "declined: the command never ran");
+
+        let script = run_script(&store, &mut Scripted::new([text("y")]), &["tagit"]).unwrap();
+        assert!(ran.exists() && script.contains("echo v9"), "{script}");
+        let given = run_script(&store, &mut Scripted::new([]), &["tagit", "mine"]).unwrap();
+        assert!(
+            given.contains("echo mine"),
+            "an argument replaces the computed default"
+        );
+    }
+
+    #[test]
+    fn a_failing_computed_default_stops_the_run_and_names_the_parameter() {
+        let fx = Fixture::new();
+        let wf = Workflow::new(
+            String::new(),
+            strings(&["echo {{b}}"]),
+            vec![param("b", Some("$(exit 4)"), &[])],
+        );
+        fx.put_workflow("config/workflows", "w", &wf);
+        let err = run_script(&fx.store_in("w"), &mut Scripted::new([]), &["w"])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("default of `b`") && err.contains("exit"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn choices_are_picked_by_number_or_name_and_bad_arguments_are_refused() {
+        let fx = Fixture::new();
+        let wf = Workflow::new(
+            String::new(),
+            strings(&["echo {{env}}"]),
+            vec![param("env", None, &["dev", "prod"])],
+        );
+        fx.put_workflow("config/workflows", "d", &wf);
+        let store = fx.store_in("w");
+
+        let mut ui = Scripted::new([text("3"), text("2")]);
+        assert!(run_script(&store, &mut ui, &["d"])
+            .unwrap()
+            .contains("echo prod"));
+        assert!(
+            ui.transcript().contains("choose one of: dev, prod"),
+            "3 is out of range"
+        );
+        assert!(
+            run_script(&store, &mut Scripted::new([text("dev")]), &["d"])
+                .unwrap()
+                .contains("echo dev")
+        );
+        let err = run_script(&store, &mut Scripted::new([]), &["d", "qa"]).unwrap_err();
+        assert!(err.to_string().contains("not a valid env"), "{err}");
+    }
+
+    #[test]
+    fn from_starts_later_but_keeps_numbering_and_rejects_steps_past_the_end() {
+        let fx = Fixture::new();
+        global_workflow(&fx, "three", &["echo a", "echo b", "echo c"], &[]);
+        let store = fx.store_in("w");
+        let script = run_script(&store, &mut Scripted::new([]), &["--from", "2", "three"]).unwrap();
+        assert!(
+            !script.contains("echo a")
+                && script.contains("__fr_i=2")
+                && script.contains("/3 failed"),
+            "{script}"
+        );
+        assert!(run_script(&store, &mut Scripted::new([]), &["--from=4", "three"]).is_err());
+        assert!(Options::parse(&strings(&["--from", "0", "x"])).is_err());
+        assert!(Options::parse(&strings(&["--from"])).is_err());
+    }
+
+    #[test]
+    fn the_resume_state_names_the_scope_and_every_bound_value() {
+        let fx = Fixture::new();
+        global_workflow(
+            &fx,
+            "go",
+            &["echo {{a}} {{b}}"],
+            &[("a", None), ("b", Some("dflt"))],
+        );
+        let script = run_script(&fx.store_in("w"), &mut Scripted::new([]), &["go", "x y"]).unwrap();
+        assert!(
+            script.contains(r"FR_RESUME='-g go '\''x y'\'' dflt'"),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn runaway_nesting_and_the_wrong_shell_are_refused() {
+        let fx = Fixture::new();
+        global_workflow(&fx, "loop", &["fr loop"], &[]);
+        let mut fish = Workflow::new(String::new(), strings(&["echo hi"]), vec![]);
+        fish.shell = Dialect::Fish;
+        fx.put_workflow("config/workflows", "fishy", &fish);
+        let store = fx.store_in("w");
+        let deep = Options {
+            depth: MAX_DEPTH + 1,
+            ..Options::parse(&strings(&["loop"])).unwrap()
+        };
+        let err = run(&store, &mut Scripted::new([]), &deep, &mut Vec::new()).unwrap_err();
+        assert!(err.to_string().contains("run itself"), "{err}");
+
+        let err = run_script(&store, &mut Scripted::new([]), &["fishy"]).unwrap_err();
+        assert!(err.to_string().contains("recorded in fish"), "{err}");
+        let in_fish = Options {
+            shell: Shell::Fish,
+            ..Options::parse(&strings(&["fishy"])).unwrap()
+        };
+        let mut out = Vec::new();
+        run(&store, &mut Scripted::new([]), &in_fish, &mut out).unwrap();
+        assert!(String::from_utf8(out).unwrap().contains("__fr_status"));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! The workflow data model and its invariants.
 
+use crate::render::Dialect;
 use crate::{cli, render, Error, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -50,15 +51,59 @@ pub struct Param {
     /// The value seen while recording, shown as a hint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub example: Option<String>,
+    /// When set, the only values accepted (offered as a picker and in completion).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<String>,
 }
 
 impl Param {
     pub fn new(name: impl Into<String>, example: Option<String>) -> Self {
         Self {
             name: name.into(),
-            default: None,
             example,
+            ..Self::default()
         }
+    }
+
+    /// A default such as `$(git branch --show-current)` is computed by the shell each run.
+    pub fn computed_default(&self) -> Option<&str> {
+        self.default.as_deref().filter(|d| is_computed(d))
+    }
+
+    /// Check a value against `choices`.
+    pub fn accepts(&self, value: &str) -> Result<()> {
+        if self.choices.is_empty() || self.choices.iter().any(|c| c == value) {
+            return Ok(());
+        }
+        Err(Error::usage(format!(
+            "`{value}` is not a valid {} — choose one of: {}",
+            self.name,
+            self.choices.join(", ")
+        )))
+    }
+}
+
+/// Whether a default value contains a command substitution to run at replay time.
+pub fn is_computed(value: &str) -> bool {
+    value.contains("$(")
+}
+
+/// Split a step into its "allowed to fail" marker and its command. Like make, a leading
+/// `-` marks a step whose failure is reported but does not stop the workflow.
+pub fn split_optional(step: &str) -> (bool, &str) {
+    match step.strip_prefix('-') {
+        Some(rest) => (true, rest.trim_start()),
+        None => (false, step),
+    }
+}
+
+/// The step text with the "allowed to fail" marker set or cleared.
+pub fn set_optional(step: &str, optional: bool) -> String {
+    let (_, command) = split_optional(step);
+    if optional {
+        format!("-{command}")
+    } else {
+        command.to_owned()
     }
 }
 
@@ -72,6 +117,9 @@ pub struct Workflow {
     pub steps: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub params: Vec<Param>,
+    /// The shell language the steps are written in; absent means zsh/bash.
+    #[serde(default, skip_serializing_if = "Dialect::is_posix")]
+    pub shell: Dialect,
 }
 
 const fn current_version() -> u32 {
@@ -85,6 +133,7 @@ impl Workflow {
             description,
             steps,
             params,
+            shell: Dialect::Posix,
         }
     }
 
@@ -123,8 +172,29 @@ impl Workflow {
                     p.name
                 )));
             }
+            if let Some(default) = p.default.as_deref().filter(|d| !is_computed(d)) {
+                p.accepts(default).map_err(|_| {
+                    Error::invalid(format!(
+                        "the default of `{}` ({default}) is not one of its choices",
+                        p.name
+                    ))
+                })?;
+            }
+            if p.choices
+                .iter()
+                .enumerate()
+                .any(|(j, c)| p.choices[..j].contains(c))
+            {
+                return Err(Error::invalid(format!(
+                    "parameter `{}` lists a choice twice",
+                    p.name
+                )));
+            }
         }
         for step in &self.steps {
+            if split_optional(step).1.trim().is_empty() {
+                return Err(Error::invalid("a step is empty"));
+            }
             if let Some(name) = render::placeholders(step).find(|n| self.param(n).is_none()) {
                 return Err(Error::invalid(format!(
                     "a step uses {{{{{name}}}}} but no parameter has that name"
@@ -180,7 +250,9 @@ mod tests {
                 name: "a".into(),
                 default: Some("x y".into()),
                 example: Some("z".into()),
+                choices: vec!["x y".into(), "w".into()],
             }],
+            shell: Dialect::Fish,
         };
         let text = toml::to_string_pretty(&original).unwrap();
         assert_eq!(toml::from_str::<Workflow>(&text).unwrap(), original);
@@ -212,6 +284,51 @@ mod tests {
         assert!(
             wf(&["a"], &["not valid"]).validate().is_err(),
             "bad parameter name"
+        );
+    }
+
+    #[test]
+    fn defaults_must_be_one_of_the_choices_unless_computed() {
+        let mut w = wf(&["deploy {{env}}"], &["env"]);
+        w.params[0].choices = vec!["dev".into(), "prod".into()];
+        w.params[0].default = Some("prod".into());
+        assert!(w.validate().is_ok());
+        w.params[0].default = Some("staging".into());
+        assert!(w
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("not one of its choices"));
+        w.params[0].default = Some("$(cat .env-name)".into());
+        assert!(
+            w.validate().is_ok(),
+            "computed defaults are checked when they run"
+        );
+        w.params[0].choices.push("dev".into());
+        assert!(w.validate().is_err(), "duplicate choice");
+    }
+
+    #[test]
+    fn choices_restrict_values_and_name_the_alternatives() {
+        let mut p = Param::new("env", None);
+        assert!(p.accepts("anything").is_ok(), "no choices: anything goes");
+        p.choices = vec!["dev".into(), "prod".into()];
+        assert!(p.accepts("prod").is_ok());
+        let err = p.accepts("Prod").unwrap_err().to_string();
+        assert!(err.contains("dev, prod"), "{err}");
+    }
+
+    #[test]
+    fn a_leading_dash_marks_a_step_that_may_fail() {
+        assert_eq!(split_optional("-pnpm lint"), (true, "pnpm lint"));
+        assert_eq!(split_optional("- pnpm lint"), (true, "pnpm lint"));
+        assert_eq!(split_optional("pnpm lint"), (false, "pnpm lint"));
+        assert_eq!(set_optional("pnpm lint", true), "-pnpm lint");
+        assert_eq!(set_optional("-pnpm lint", false), "pnpm lint");
+        assert_eq!(set_optional("-pnpm lint", true), "-pnpm lint");
+        assert!(
+            wf(&["-"], &[]).validate().is_err(),
+            "a bare marker is empty"
         );
     }
 
