@@ -51,6 +51,9 @@ SETUP
   zsh   ~/.zshrc (after compinit)    eval \"$(fr init zsh)\"
   bash  ~/.bashrc                    eval \"$(fr init bash)\"
   fish  ~/.config/fish/config.fish   fr init fish | source
+
+DOCS
+  https://github.com/omraval18/flow-record/blob/main/docs/reference.md
 ";
 
 /// Built-in command names; workflows may not use them.
