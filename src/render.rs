@@ -5,8 +5,26 @@
 //! lands in (bare word, `'single'` or `"double"` quotes) and cannot change the meaning of
 //! the surrounding command.
 
+use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fmt::Write as _;
+
+/// The shell language steps are written in. zsh and bash share POSIX quoting and control
+/// flow; fish has its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Dialect {
+    #[default]
+    Posix,
+    Fish,
+}
+
+impl Dialect {
+    pub const fn is_posix(&self) -> bool {
+        matches!(self, Self::Posix)
+    }
+}
 
 /// Quoting context at a position inside a shell command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,9 +71,18 @@ pub fn placeholders(raw: &str) -> impl Iterator<Item = &str> {
     })
 }
 
+/// [`substitute_in`] for POSIX shells.
+pub fn substitute(raw: &str, emit: impl FnMut(&str, Quote) -> Option<String>) -> String {
+    substitute_in(Dialect::Posix, raw, emit)
+}
+
 /// Copy `raw`, replacing each placeholder with `emit(name, quote_context)`.
 /// A placeholder for which `emit` returns `None` is left untouched.
-pub fn substitute(raw: &str, mut emit: impl FnMut(&str, Quote) -> Option<String>) -> String {
+pub fn substitute_in(
+    dialect: Dialect,
+    raw: &str,
+    mut emit: impl FnMut(&str, Quote) -> Option<String>,
+) -> String {
     let bytes = raw.as_bytes();
     let mut out = String::with_capacity(raw.len());
     let (mut quote, mut i, mut copied) = (Quote::Bare, 0, 0);
@@ -73,6 +100,13 @@ pub fn substitute(raw: &str, mut emit: impl FnMut(&str, Quote) -> Option<String>
             }
         }
         match (quote, bytes[i]) {
+            // fish lets `\'` and `\\` escape inside single quotes; POSIX does not.
+            (Quote::Single, b'\\')
+                if dialect == Dialect::Fish && matches!(bytes.get(i + 1), Some(b'\'' | b'\\')) =>
+            {
+                i += 2;
+                continue;
+            }
             (Quote::Single, b'\'') => quote = Quote::Bare,
             (Quote::Single, _) => {}
             (_, b'\\') => {
@@ -90,34 +124,54 @@ pub fn substitute(raw: &str, mut emit: impl FnMut(&str, Quote) -> Option<String>
     out
 }
 
-/// Escape `value` so it is read back verbatim in context `ctx`.
+/// [`quote_in`] for POSIX shells.
 pub fn quote(value: &str, ctx: Quote) -> Cow<'_, str> {
-    const SAFE: &str = "_-./:=@%+,";
-    match ctx {
-        Quote::Bare if value.is_empty() => Cow::Borrowed("''"),
-        Quote::Bare
-            if value
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || SAFE.contains(c)) =>
-        {
-            Cow::Borrowed(value)
-        }
-        Quote::Bare => Cow::Owned(format!("'{}'", value.replace('\'', r"'\''"))),
-        Quote::Single => Cow::Owned(value.replace('\'', r"'\''")),
-        Quote::Double => {
-            if !value.contains(['\\', '"', '$', '`']) {
-                return Cow::Borrowed(value);
-            }
-            let mut out = String::with_capacity(value.len() + 4);
-            for c in value.chars() {
-                if matches!(c, '\\' | '"' | '$' | '`') {
-                    out.push('\\');
-                }
-                out.push(c);
-            }
-            Cow::Owned(out)
-        }
+    quote_in(Dialect::Posix, value, ctx)
+}
+
+fn escape_with_backslash<'a>(value: &'a str, special: &[char]) -> Cow<'a, str> {
+    if !value.contains(special) {
+        return Cow::Borrowed(value);
     }
+    let mut out = String::with_capacity(value.len() + 4);
+    for c in value.chars() {
+        if special.contains(&c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    Cow::Owned(out)
+}
+
+/// Escape `value` so the shell reads it back verbatim in context `ctx`.
+pub fn quote_in(dialect: Dialect, value: &str, ctx: Quote) -> Cow<'_, str> {
+    // `%` starts a process expansion in older fish, so it is only safe in POSIX shells.
+    let safe = |c: char| {
+        c.is_ascii_alphanumeric()
+            || "_-./:=@+,".contains(c)
+            || (c == '%' && dialect == Dialect::Posix)
+    };
+    match (dialect, ctx) {
+        (_, Quote::Bare) if value.is_empty() => Cow::Borrowed("''"),
+        (_, Quote::Bare) if value.chars().all(safe) => Cow::Borrowed(value),
+        (Dialect::Posix, Quote::Bare) => Cow::Owned(format!("'{}'", value.replace('\'', r"'\''"))),
+        (Dialect::Posix, Quote::Single) => Cow::Owned(value.replace('\'', r"'\''")),
+        (Dialect::Posix, Quote::Double) => escape_with_backslash(value, &['\\', '"', '$', '`']),
+        (Dialect::Fish, Quote::Bare) => {
+            Cow::Owned(format!("'{}'", escape_with_backslash(value, &['\\', '\''])))
+        }
+        (Dialect::Fish, Quote::Single) => escape_with_backslash(value, &['\\', '\'']),
+        (Dialect::Fish, Quote::Double) => escape_with_backslash(value, &['\\', '"', '$']),
+    }
+}
+
+/// Quote each word for a bare position and join them with spaces.
+pub fn words(dialect: Dialect, words: &[String]) -> String {
+    words
+        .iter()
+        .map(|w| quote_in(dialect, w, Quote::Bare))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Fill `raw` with `values`; placeholders without a value are left as written.
@@ -138,27 +192,129 @@ pub fn export_step(raw: &str) -> String {
     })
 }
 
-/// Join steps into one script for the shell function to `eval` **in the current shell**
-/// (so `cd`, `export` and `source` persist). Steps are chained with `&&` and run until
-/// the first failure; the script reports which step failed and returns its status.
-///
-/// The caller must declare `__fr_i` and `__fr_rc` as locals and evaluate the script inside
-/// a function, because the script ends with `return`.
-pub fn chain(steps: &[String]) -> String {
-    let mut script = String::from("__fr_i=1");
-    for (i, step) in steps.iter().enumerate() {
-        if i > 0 {
-            script.push_str(&format!(" && __fr_i={}", i + 1));
+/// A step ready to run: placeholders filled in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rendered {
+    pub text: String,
+    /// A failure is reported and the workflow carries on.
+    pub optional: bool,
+}
+
+/// Everything needed to turn rendered steps into the script the shell function `eval`s.
+#[derive(Debug, Clone)]
+pub struct Script<'a> {
+    pub dialect: Dialect,
+    pub steps: &'a [Rendered],
+    /// 1-based number of `steps[0]` (greater than 1 when resuming).
+    pub first: usize,
+    pub total: usize,
+    /// Arguments that re-run this workflow with the same values; stored on failure so
+    /// `fr resume` can continue from the failed step.
+    pub resume: Option<&'a [String]>,
+    /// Add each step to the shell's history as it runs (via `__fr_remember`).
+    pub remember: bool,
+}
+
+impl Script<'_> {
+    /// Build the script. It runs **in the current shell** (so `cd`, `export` and
+    /// `source` persist), stops at the first failure of a required step, says which step
+    /// failed, and leaves the status in `__fr_rc`.
+    ///
+    /// POSIX scripts end with `return`, so the caller evaluates them inside a function
+    /// with `__fr_i` and `__fr_rc` declared local. fish scripts end by calling
+    /// `__fr_status`, which the fish integration defines.
+    pub fn render(&self) -> String {
+        match self.dialect {
+            Dialect::Posix => self.posix(),
+            Dialect::Fish => self.fish(),
         }
-        script.push_str(" && {\n");
-        script.push_str(step);
-        script.push_str("\n}");
     }
-    script.push_str(&format!(
-        " || {{ __fr_rc=$?; echo \"fr: step $__fr_i/{} failed (earlier steps already ran)\" >&2; }}\nreturn ${{__fr_rc:-0}}\n",
-        steps.len()
-    ));
-    script
+
+    fn number(&self, i: usize) -> usize {
+        self.first + i
+    }
+
+    fn posix(&self) -> String {
+        let total = self.total;
+        let mut s = String::new();
+        for (i, step) in self.steps.iter().enumerate() {
+            if i > 0 {
+                s.push_str(" && ");
+            }
+            let n = self.number(i);
+            let _ = write!(s, "__fr_i={n}");
+            if self.remember {
+                let _ = write!(s, " && __fr_remember {}", quote(&step.text, Quote::Bare));
+            }
+            if step.optional {
+                let _ = write!(
+                    s,
+                    " && {{ {{\n{}\n}} || echo \"fr: step {n}/{total} failed with status $? (allowed to fail, continuing)\" >&2; }}",
+                    step.text
+                );
+            } else {
+                let _ = write!(s, " && {{\n{}\n}}", step.text);
+            }
+        }
+        let mut on_failure = String::from("__fr_rc=$?; ");
+        let mut hint = "earlier steps already ran";
+        if let Some(args) = self.resume {
+            s.push_str(" && FR_RESUME=");
+            let _ = write!(
+                on_failure,
+                "FR_RESUME_STEP=$__fr_i; FR_RESUME={}; ",
+                quote(&words(Dialect::Posix, args), Quote::Bare)
+            );
+            hint = "earlier steps already ran; fix it, then run: fr resume";
+        }
+        let _ = write!(
+            s,
+            " || {{ {on_failure}echo \"fr: step $__fr_i/{total} failed ({hint})\" >&2; }}\nreturn ${{__fr_rc:-0}}\n"
+        );
+        s
+    }
+
+    fn fish(&self) -> String {
+        let total = self.total;
+        let mut s = String::from("set __fr_rc 0\n");
+        for (i, step) in self.steps.iter().enumerate() {
+            let and = if i > 0 { "and " } else { "" };
+            let n = self.number(i);
+            let _ = writeln!(s, "{and}set __fr_i {n}");
+            if self.remember {
+                let _ = writeln!(
+                    s,
+                    "and __fr_remember {}",
+                    quote_in(Dialect::Fish, &step.text, Quote::Bare)
+                );
+            }
+            if step.optional {
+                let _ = writeln!(
+                    s,
+                    "and begin\nbegin\n{}\nend\nor echo \"fr: step {n}/{total} failed with status $status (allowed to fail, continuing)\" >&2\ntrue\nend",
+                    step.text
+                );
+            } else {
+                let _ = writeln!(s, "and begin\n{}\nend", step.text);
+            }
+        }
+        let mut on_failure = String::from("set __fr_rc $status\n");
+        let mut hint = "earlier steps already ran";
+        if let Some(args) = self.resume {
+            s.push_str("and set -g FR_RESUME\n");
+            let _ = writeln!(
+                on_failure,
+                "set -g FR_RESUME_STEP $__fr_i\nset -g FR_RESUME {}",
+                words(Dialect::Fish, args)
+            );
+            hint = "earlier steps already ran; fix it, then run: fr resume";
+        }
+        let _ = write!(
+            s,
+            "or begin\n{on_failure}echo \"fr: step $__fr_i/{total} failed ({hint})\" >&2\nend\n__fr_status $__fr_rc\n"
+        );
+        s
+    }
 }
 
 // ---- turning recorded literals into placeholders -------------------------------------
@@ -316,8 +472,22 @@ mod tests {
     #[test]
     fn chain_runs_steps_in_the_current_shell_and_stops_at_the_first_failure() {
         let run = |steps: &[&str]| {
-            let steps: Vec<String> = steps.iter().map(|s| (*s).to_owned()).collect();
-            let script = chain(&steps);
+            let steps: Vec<Rendered> = steps
+                .iter()
+                .map(|s| Rendered {
+                    optional: s.starts_with('-'),
+                    text: s.trim_start_matches('-').to_owned(),
+                })
+                .collect();
+            let script = Script {
+                dialect: Dialect::Posix,
+                steps: &steps,
+                first: 1,
+                total: steps.len(),
+                resume: None,
+                remember: false,
+            }
+            .render();
             let wrapper = format!(
                 "f() {{ local __fr_i __fr_rc; eval \"$1\"; }}\nf '{}'\necho \"rc=$?\"",
                 script.replace('\'', r"'\''")
@@ -339,6 +509,118 @@ mod tests {
         let (out, err) = run(&["echo one", "sh -c 'exit 7'", "echo never"]);
         assert_eq!(out, "one\nrc=7\n");
         assert!(err.contains("step 2/3 failed"), "{err}");
+    }
+
+    /// Run a POSIX script the way the shell function does, then print what `fr resume`
+    /// would use.
+    fn run_script(script: &Script<'_>) -> (String, String) {
+        let wrapper = format!(
+            "__fr_remember() {{ :; }}\nf() {{ local __fr_i __fr_rc; eval \"$1\"; }}\nf '{}'\necho \"rc=$?\"\necho \"step=$FR_RESUME_STEP\"\neval \"set -- $FR_RESUME\"\nprintf '%s|' \"$@\"",
+            script.render().replace('\'', r"'\''")
+        );
+        let out = Command::new("bash")
+            .args(["-c", &wrapper])
+            .output()
+            .unwrap();
+        (
+            String::from_utf8(out.stdout).unwrap(),
+            String::from_utf8(out.stderr).unwrap(),
+        )
+    }
+
+    fn rendered(steps: &[(&str, bool)]) -> Vec<Rendered> {
+        steps
+            .iter()
+            .map(|&(text, optional)| Rendered {
+                text: text.into(),
+                optional,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn optional_failures_are_reported_and_a_real_failure_leaves_what_resume_needs() {
+        let steps = rendered(&[
+            ("echo one", false),
+            ("sh -c 'exit 3'", true),
+            ("false", false),
+            ("echo never", false),
+        ]);
+        let resume = ["-g".to_owned(), "w".to_owned(), "it's a value".to_owned()];
+        let (out, err) = run_script(&Script {
+            dialect: Dialect::Posix,
+            steps: &steps,
+            first: 1,
+            total: 4,
+            resume: Some(&resume),
+            remember: true,
+        });
+        assert_eq!(out, "one\nrc=1\nstep=3\n-g|w|it's a value|");
+        assert!(
+            err.contains("step 2/4 failed with status 3 (allowed to fail"),
+            "{err}"
+        );
+        assert!(
+            err.contains("step 3/4 failed") && err.contains("fr resume"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_resumed_script_keeps_the_original_step_numbers_and_clears_resume_on_success() {
+        let steps = rendered(&[("false", false), ("echo never", false)]);
+        let (_, err) = run_script(&Script {
+            dialect: Dialect::Posix,
+            steps: &steps,
+            first: 3,
+            total: 4,
+            resume: Some(&[]),
+            remember: false,
+        });
+        assert!(err.contains("step 3/4 failed"), "{err}");
+
+        let ok = rendered(&[("true", false)]);
+        let (out, _) = run_script(&Script {
+            dialect: Dialect::Posix,
+            steps: &ok,
+            first: 1,
+            total: 1,
+            resume: Some(&["x".to_owned()]),
+            remember: false,
+        });
+        assert!(out.starts_with("rc=0\nstep=\n"), "{out}");
+        assert!(
+            !out.contains('x'),
+            "a success leaves nothing to resume: {out}"
+        );
+    }
+
+    #[test]
+    fn fish_quoting_uses_backslash_escapes_inside_quotes() {
+        let fish = |v, ctx| quote_in(Dialect::Fish, v, ctx).into_owned();
+        assert_eq!(fish(r"it's \ $x", Quote::Bare), r"'it\'s \\ $x'");
+        assert_eq!(fish(r"it's \", Quote::Single), r"it\'s \\");
+        assert_eq!(fish(r#"a"$b\"#, Quote::Double), r#"a\"\$b\\"#);
+        assert_eq!(fish("100%", Quote::Bare), "'100%'", "% is special in fish");
+        assert_eq!(quote("100%", Quote::Bare), "100%");
+    }
+
+    #[test]
+    fn in_fish_an_escaped_quote_does_not_end_a_single_quoted_string() {
+        let ctx = |dialect| {
+            let mut seen = None;
+            substitute_in(dialect, r"echo 'it\'s {{v}}'", |_, q| {
+                seen = Some(q);
+                None
+            });
+            seen.unwrap()
+        };
+        assert_eq!(ctx(Dialect::Fish), Quote::Single);
+        assert_eq!(
+            ctx(Dialect::Posix),
+            Quote::Bare,
+            "in POSIX, \\' ends the quote"
+        );
     }
 
     #[test]

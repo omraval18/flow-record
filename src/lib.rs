@@ -5,7 +5,9 @@
 //! | module | responsibility |
 //! |---|---|
 //! | [`cli`] | argument parsing and dispatch |
+//! | [`shell`] | the supported shells and their integration scripts |
 //! | [`session`] | the per-shell log the shell hooks append to while recording |
+//! | [`history`] | the log of every command, behind `fr save` and `fr suggest` |
 //! | [`record`] | the post-recording review that turns a session into a workflow |
 //! | [`edit`] | interactive editing of a saved workflow |
 //! | [`run`] | resolving, binding arguments, confirming and rendering a replay |
@@ -13,7 +15,7 @@
 //! | [`store`] | workflow files, project/global scoping, ranking and trust |
 //! | [`workflow`] | the workflow data model and its invariants |
 //! | [`render`] | shell-aware placeholder substitution (pure) |
-//! | [`suggest`] | parameter and name suggestions (pure) |
+//! | [`suggest`] | parameter, name and habit suggestions (pure) |
 //! | [`destructive`] | heuristic detection of dangerous steps (pure) |
 //! | [`ui`] | prompts and styling behind the [`ui::Ui`] trait |
 //!
@@ -25,11 +27,13 @@ pub mod cli;
 pub mod destructive;
 pub mod edit;
 pub mod error;
+pub mod history;
 pub mod manage;
 pub mod record;
 pub mod render;
 pub mod run;
 pub mod session;
+pub mod shell;
 pub mod store;
 pub mod suggest;
 pub mod ui;

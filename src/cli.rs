@@ -5,13 +5,12 @@
 //! sub-millisecond start and a small binary matter more than derive-generated help.
 
 use crate::run::Options;
+use crate::shell::Shell;
 use crate::store::Store;
 use crate::ui::{Pal, Ui};
-use crate::{edit, manage, record, run, session, Error, Result};
+use crate::{edit, history, manage, record, run, session, Error, Result};
 use std::io::Write;
 use std::path::PathBuf;
-
-const ZSH_INTEGRATION: &str = include_str!("../shell/fr.zsh");
 
 pub const USAGE: &str = "fr — record terminal workflows once, replay them anywhere
 
@@ -19,51 +18,80 @@ USAGE
   fr                          Start recording; run again to stop and save
   fr <name> [args…]           Run a workflow (a unique prefix works: fr ne)
 
-COMMANDS
+CREATE
   record, stop, status        Control recording
-  run <name> [args…]          Run a workflow (same as fr <name>)
+  save [n]                    Save commands you already ran (the last n, or pick)
+  suggest                     Turn a sequence you keep typing into a workflow
+
+RUN
+  run <name> [args…]          Same as fr <name>
+  resume                      Continue the last failed workflow from the failed step
+
+MANAGE
   list, ls                    Workflows for this folder, most relevant first
   show <name>                 Print a workflow
-  edit <name>                 Change its name, scope, parameters and steps
+  edit <name>                 Change name, scope, parameters, choices and steps
   rm <name>                   Delete a workflow
   export <name>               Print a portable bash script
-  init zsh                    Print the shell integration
+  shim [name…]                Run workflows without typing fr (next = fr next)
+  unshim <name…>              Undo shim
+  init zsh|bash|fish          Print the shell integration
 
 RUN FLAGS
   -n, --dry-run               Preview only
   -y, --yes                   Skip the destructive-step confirmation
   -g, --global                Use the global workflow
   -p, --project               Use the project workflow
+  --from <step>               Start at this step
 
 EDIT FLAGS
   -e, --file                  Open the raw TOML in $EDITOR
 
 SETUP
-  Add to ~/.zshrc (after compinit):   eval \"$(fr init zsh)\"
+  zsh   ~/.zshrc (after compinit)    eval \"$(fr init zsh)\"
+  bash  ~/.bashrc                    eval \"$(fr init bash)\"
+  fish  ~/.config/fish/config.fish   fr init fish | source
 ";
 
 /// Built-in command names; workflows may not use them.
 const COMMANDS: &[&str] = &[
     "record", "start", "stop", "status", "run", "list", "ls", "show", "edit", "rm", "delete",
-    "remove", "export", "init", "version", "help",
+    "remove", "export", "init", "version", "help", "save", "suggest", "resume", "shim", "unshim",
 ];
 
 pub fn is_reserved(name: &str) -> bool {
     COMMANDS.contains(&name)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Shell {
-    Zsh,
+/// Whether `fr <args>` replays a workflow (as opposed to controlling fr itself).
+pub fn is_replay(args: &[String]) -> bool {
+    let args = match args.split_first() {
+        Some((first, rest)) if first == "run" => rest,
+        _ => args,
+    };
+    matches!(
+        Options::parse(args),
+        Ok(o) if !o.dry_run && !is_reserved(&o.name) && !o.name.starts_with('_')
+    )
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
-    Record,
+    Record {
+        shell: Shell,
+    },
     Stop {
         session: PathBuf,
     },
     Run(Options),
+    Save {
+        shell: Shell,
+        pid: u32,
+        count: Option<usize>,
+    },
+    Suggest {
+        shell: Shell,
+    },
     List,
     Show {
         name: String,
@@ -78,6 +106,12 @@ pub enum Command {
     Export {
         name: String,
     },
+    Shim {
+        names: Vec<String>,
+    },
+    Unshim {
+        names: Vec<String>,
+    },
     Init(Shell),
     Help,
     Version,
@@ -91,6 +125,21 @@ pub enum Command {
     Complete {
         args: Vec<String>,
     },
+}
+
+fn shell_arg(name: &str) -> Result<Shell> {
+    Shell::parse(name).ok_or_else(|| {
+        Error::usage(format!(
+            "`{name}` is not a supported shell — use zsh, bash or fish"
+        ))
+    })
+}
+
+fn needs_integration() -> Error {
+    Error::usage(
+        "this needs the shell integration — add `eval \"$(fr init zsh)\"` to ~/.zshrc \
+         (bash: `eval \"$(fr init bash)\"` in ~/.bashrc; fish: `fr init fish | source` in config.fish)",
+    )
 }
 
 impl Command {
@@ -110,11 +159,58 @@ impl Command {
         Ok(match first.as_str() {
             "help" | "-h" | "--help" => Self::Help,
             "version" | "-V" | "--version" => Self::Version,
-            "record" | "start" => Self::Record,
+            "record" | "start" => Self::Record {
+                shell: match rest {
+                    [] => Shell::Zsh,
+                    [shell] => shell_arg(shell)?,
+                    _ => return Err(Error::usage("usage: fr record")),
+                },
+            },
             "stop" => Self::Stop {
                 session: PathBuf::from(one("session file")?),
             },
             "run" | "_run" => Self::Run(Options::parse(rest)?),
+            // `_exec <shell> <depth> [flags] <name> [args…]`, from the shell function.
+            "_exec" => match rest {
+                [shell, depth, run @ ..] => Self::Run(Options {
+                    shell: shell_arg(shell)?,
+                    depth: depth.parse().unwrap_or(0),
+                    remember: true,
+                    ..Options::parse(run)?
+                }),
+                _ => {
+                    return Err(Error::usage(
+                        "usage: fr _exec <shell> <depth> <workflow> [args…]",
+                    ))
+                }
+            },
+            "_save" => match rest {
+                [shell, pid, count @ ..] => Self::Save {
+                    shell: shell_arg(shell)?,
+                    pid: pid
+                        .parse()
+                        .map_err(|_| Error::usage(format!("bad shell pid `{pid}`")))?,
+                    count: match count {
+                        [] => None,
+                        [n] => {
+                            Some(n.parse::<usize>().ok().filter(|&n| n > 0).ok_or_else(|| {
+                                Error::usage(format!(
+                                    "`{n}` is not a number of commands — usage: fr save [n]"
+                                ))
+                            })?)
+                        }
+                        _ => return Err(Error::usage("usage: fr save [n]")),
+                    },
+                },
+                _ => return Err(Error::usage("usage: fr _save <shell> <pid> [n]")),
+            },
+            "suggest" | "_suggest" => Self::Suggest {
+                shell: match rest {
+                    [] => Shell::Zsh,
+                    [shell] if first == "_suggest" => shell_arg(shell)?,
+                    _ => return Err(Error::usage("usage: fr suggest")),
+                },
+            },
             "list" | "ls" => Self::List,
             "show" => Self::Show {
                 name: one("workflow")?,
@@ -125,10 +221,17 @@ impl Command {
             "export" => Self::Export {
                 name: one("workflow")?,
             },
+            "shim" => Self::Shim {
+                names: rest.to_vec(),
+            },
+            "unshim" if !rest.is_empty() => Self::Unshim {
+                names: rest.to_vec(),
+            },
+            "unshim" => return Err(Error::usage("usage: fr unshim <name…>")),
             "edit" => parse_edit(rest)?,
             "init" => match rest {
-                [shell] if shell == "zsh" => Self::Init(Shell::Zsh),
-                _ => return Err(Error::usage("usage: fr init zsh")),
+                [shell] => Self::Init(shell_arg(shell)?),
+                _ => return Err(Error::usage("usage: fr init zsh|bash|fish")),
             },
             "_ev" => match rest {
                 [session, status, command] => Self::Event {
@@ -143,11 +246,7 @@ impl Command {
             "_complete" => Self::Complete {
                 args: rest.to_vec(),
             },
-            _ => {
-                return Err(Error::usage(
-                    "this needs the shell integration — add `eval \"$(fr init zsh)\"` to ~/.zshrc",
-                ))
-            }
+            _ => return Err(needs_integration()),
         })
     }
 }
@@ -181,9 +280,13 @@ pub fn execute(
     match command {
         Command::Help => out.write_all(USAGE.as_bytes())?,
         Command::Version => writeln!(out, "fr {}", env!("CARGO_PKG_VERSION"))?,
-        Command::Init(Shell::Zsh) => out.write_all(ZSH_INTEGRATION.as_bytes())?,
-        Command::Record => {
-            let path = session::create(&store.dirs().sessions(), store.cwd())?;
+        Command::Init(shell) => {
+            let log = store.dirs().history_log();
+            let _ = history::compact(&log);
+            out.write_all(shell.integration(&log, &store.shims()).as_bytes())?;
+        }
+        Command::Record { shell } => {
+            let path = session::create(&store.dirs().sessions(), store.cwd(), shell.dialect())?;
             writeln!(out, "{}", path.display())?;
         }
         Command::Stop { session } => record::finish(ui, store, &session)?,
@@ -195,11 +298,20 @@ pub fn execute(
             session::append(&session, status, &command)?;
         }
         Command::Run(options) => run::run(store, ui, &options, out)?,
-        Command::List => manage::list(store, Pal::stdout(), out)?,
+        Command::Save { shell, pid, count } => {
+            record::save(ui, store, pid, count, shell.dialect())?;
+        }
+        Command::Suggest { shell } => record::suggest(ui, store, shell.dialect())?,
+        Command::List => {
+            let habits = record::habits_here(store).len();
+            manage::list(store, Pal::stdout(), habits, out)?;
+        }
         Command::Show { name } => manage::show(store, ui, Pal::stdout(), &name, out)?,
         Command::Edit { name, raw_file } => edit::edit(store, ui, &name, raw_file)?,
         Command::Remove { name } => manage::remove(store, ui, &name)?,
         Command::Export { name } => manage::export(store, ui, &name, out)?,
+        Command::Shim { names } => manage::shim(store, ui, &names, out)?,
+        Command::Unshim { names } => manage::unshim(store, ui, &names)?,
         Command::Complete { args } => manage::complete(store, &args, out)?,
     }
     Ok(())
@@ -229,8 +341,13 @@ mod tests {
 
     #[test]
     fn commands_and_their_aliases_parse() {
-        assert_eq!(parse(&["record"]).unwrap(), Command::Record);
-        assert_eq!(parse(&["start"]).unwrap(), Command::Record);
+        let zsh = Command::Record { shell: Shell::Zsh };
+        assert_eq!(parse(&["record"]).unwrap(), zsh);
+        assert_eq!(parse(&["start"]).unwrap(), zsh);
+        assert_eq!(
+            parse(&["record", "fish"]).unwrap(),
+            Command::Record { shell: Shell::Fish }
+        );
         assert_eq!(parse(&["ls"]).unwrap(), Command::List);
         assert_eq!(
             parse(&["rm", "x"]).unwrap(),
@@ -241,6 +358,14 @@ mod tests {
             Command::Remove { name: "x".into() }
         );
         assert_eq!(parse(&["init", "zsh"]).unwrap(), Command::Init(Shell::Zsh));
+        assert_eq!(
+            parse(&["init", "fish"]).unwrap(),
+            Command::Init(Shell::Fish)
+        );
+        assert!(parse(&["init", "tcsh"])
+            .unwrap_err()
+            .to_string()
+            .contains("zsh, bash or fish"));
         assert_eq!(parse(&["--version"]).unwrap(), Command::Version);
     }
 
@@ -290,6 +415,57 @@ mod tests {
     }
 
     #[test]
+    fn the_shell_function_passes_its_shell_and_nesting_depth() {
+        assert_eq!(
+            parse(&["_exec", "bash", "2", "--from", "3", "go", "a"]).unwrap(),
+            Command::Run(Options {
+                shell: Shell::Bash,
+                depth: 2,
+                remember: true,
+                from: Some(3),
+                name: "go".into(),
+                args: vec!["a".into()],
+                ..Options::default()
+            })
+        );
+    }
+
+    #[test]
+    fn save_takes_an_optional_positive_count() {
+        assert_eq!(
+            parse(&["_save", "zsh", "42", "3"]).unwrap(),
+            Command::Save {
+                shell: Shell::Zsh,
+                pid: 42,
+                count: Some(3)
+            }
+        );
+        assert!(matches!(
+            parse(&["_save", "zsh", "42"]).unwrap(),
+            Command::Save { count: None, .. }
+        ));
+        assert!(parse(&["_save", "zsh", "42", "0"]).is_err());
+        assert!(parse(&["_save", "zsh", "42", "x"]).is_err());
+        assert!(parse(&["save"])
+            .unwrap_err()
+            .to_string()
+            .contains("shell integration"));
+    }
+
+    #[test]
+    fn only_workflow_runs_count_as_replays() {
+        let replay =
+            |args: &[&str]| is_replay(&args.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>());
+        assert!(
+            replay(&["build"]) && replay(&["-g", "deploy", "prod"]) && replay(&["run", "build"])
+        );
+        assert!(
+            !replay(&[]) && !replay(&["list"]) && !replay(&["-n", "build"]) && !replay(&["stop"])
+        );
+        assert!(!replay(&["_ev", "x"]) && !replay(&["--help"]));
+    }
+
+    #[test]
     fn the_hook_event_carries_status_and_the_full_command() {
         assert_eq!(
             parse(&["_ev", "/s", "130", "sleep 5 && echo done"]).unwrap(),
@@ -311,7 +487,10 @@ mod tests {
 
     #[test]
     fn every_command_name_is_reserved_so_workflows_cannot_shadow_it() {
-        for name in ["list", "edit", "rm", "run", "record", "status", "export"] {
+        for name in [
+            "list", "edit", "rm", "run", "record", "status", "export", "save", "suggest", "resume",
+            "shim",
+        ] {
             assert!(is_reserved(name), "{name}");
         }
         assert!(!is_reserved("deploy"));

@@ -68,5 +68,9 @@ case ":$PATH:" in
   *) say "Note: $INSTALL_DIR is not on your PATH. Add it, e.g.  export PATH=\"$INSTALL_DIR:\$PATH\"" ;;
 esac
 say ""
-say "Last step: enable the shell integration (zsh, after compinit in ~/.zshrc):"
-say "  eval \"\$(fr init zsh)\""
+say "Last step: enable the shell integration, then open a new terminal:"
+case "${SHELL##*/}" in
+  bash) say "  echo 'eval \"\$(fr init bash)\"' >> ~/.bashrc" ;;
+  fish) say "  echo 'fr init fish | source' >> ~/.config/fish/config.fish" ;;
+  *)    say "  add  eval \"\$(fr init zsh)\"  to ~/.zshrc, after compinit" ;;
+esac

@@ -4,7 +4,8 @@
 //! ```text
 //! project  <repo>/.fr/workflows/<name>.toml     nearest ancestor of the cwd holding `.fr`
 //! global   $XDG_CONFIG_HOME/fr/workflows/<name>.toml
-//! state    $XDG_STATE_HOME/fr/{usage,trusted,sessions/}
+//! shims    $XDG_CONFIG_HOME/fr/shims               names runnable without `fr`
+//! state    $XDG_STATE_HOME/fr/{usage,trusted,history,sessions/}
 //! ```
 
 use crate::workflow::{Scope, Workflow, FORMAT_VERSION};
@@ -56,6 +57,15 @@ impl Dirs {
 
     pub fn sessions(&self) -> PathBuf {
         self.state.join("sessions")
+    }
+
+    /// Every command typed in an integrated shell (see [`crate::history`]).
+    pub fn history_log(&self) -> PathBuf {
+        self.state.join("history")
+    }
+
+    fn shims_file(&self) -> PathBuf {
+        self.config.join("shims")
     }
 
     fn usage_log(&self) -> PathBuf {
@@ -220,6 +230,32 @@ impl Store {
             }
         }
         usage
+    }
+
+    // ---- shims -----------------------------------------------------------------------
+
+    /// Workflow names that also work as plain commands, sorted.
+    pub fn shims(&self) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_to_string(self.dirs.shims_file())
+            .unwrap_or_default()
+            .lines()
+            .map(str::trim)
+            .filter(|n| crate::workflow::validate_name(n).is_ok())
+            .map(str::to_owned)
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
+    pub fn set_shims(&self, names: &[String]) -> Result<()> {
+        let path = self.dirs.shims_file();
+        fs::create_dir_all(&self.dirs.config).map_err(|e| Error::io(&self.dirs.config, e))?;
+        let mut text = names.join("\n");
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        fs::write(&path, text).map_err(|e| Error::io(&path, e))
     }
 
     // ---- trust -----------------------------------------------------------------------
@@ -597,6 +633,23 @@ mod tests {
         assert_eq!(scope_of(None), Scope::Project);
         assert_eq!(scope_of(Some(Scope::Project)), Scope::Project);
         assert_eq!(scope_of(Some(Scope::Global)), Scope::Global);
+    }
+
+    #[test]
+    fn shims_are_stored_sorted_and_deduplicated_and_bad_lines_ignored() {
+        let fx = Fixture::new();
+        let store = fx.store_in("w");
+        assert!(store.shims().is_empty());
+        store
+            .set_shims(&["next".into(), "build".into(), "next".into()])
+            .unwrap();
+        assert_eq!(store.shims(), ["build", "next"]);
+        fs::write(fx.path("config/shims"), "ok\nBad Name\n\nlist\n").unwrap();
+        assert_eq!(
+            store.shims(),
+            ["ok"],
+            "invalid and reserved names are skipped"
+        );
     }
 
     #[test]

@@ -1,13 +1,18 @@
 //! The review that follows `fr stop`: turn a recorded session into a saved workflow with
 //! as few questions as possible (which values are arguments, a name, a scope).
 
-use crate::session::{Recorded, Recording};
+use crate::history;
+use crate::render::Dialect;
+use crate::session::{self, Recorded, Recording};
 use crate::store::{self, Store};
-use crate::suggest::{self, Candidate};
+use crate::suggest::{self, Candidate, Habit};
 use crate::ui::{first_line, tilde, Choice, Ui};
 use crate::workflow::{validate_name, Param, Scope, Workflow};
-use crate::{render, Result};
+use crate::{render, Error, Result};
 use std::path::{Path, PathBuf};
+
+/// How many recent commands `fr save` offers.
+const SAVE_WINDOW: usize = 15;
 
 const DESCRIPTION_LEN: usize = 60;
 
@@ -23,22 +28,173 @@ pub struct Saved {
 /// `fr stop`: review the session log at `session_file`, then delete it.
 pub fn finish(ui: &mut dyn Ui, store: &Store, session_file: &Path) -> Result<()> {
     let recording = Recording::read(session_file)?;
-    let outcome = review(ui, store, recording);
+    let outcome = review(ui, store, recording, &[]);
     // The log has served its purpose whether or not the user saved; failing to delete a
     // temp file must not mask the outcome.
     let _ = std::fs::remove_file(session_file);
     outcome.map(|_| ())
 }
 
-/// Walk the user through saving `recording`. Returns `None` when there was nothing to save.
-pub fn review(ui: &mut dyn Ui, store: &Store, recording: Recording) -> Result<Option<Saved>> {
+/// `fr save [n]`: turn commands this shell already ran into a workflow — the last `n`,
+/// or the ones picked from the recent list.
+pub fn save(
+    ui: &mut dyn Ui,
+    store: &Store,
+    pid: u32,
+    count: Option<usize>,
+    shell: Dialect,
+) -> Result<()> {
+    let log = store.dirs().history_log();
+    let _ = history::compact(&log);
+    let entries: Vec<history::Entry> = history::read(&log)
+        .into_iter()
+        .filter(|e| {
+            e.pid == pid && e.recorded().succeeded() && session::worth_recording(&e.command)
+        })
+        .collect();
+    if entries.is_empty() {
+        ui.say("  No commands from this shell yet. Run some, then `fr save`.");
+        return Ok(());
+    }
+    let picked: Vec<&history::Entry> = match count {
+        Some(n) => entries[entries.len().saturating_sub(n)..].iter().collect(),
+        None => {
+            let recent = &entries[entries.len().saturating_sub(SAVE_WINDOW)..];
+            let pal = ui.pal();
+            ui.say(&format!("\n  {}", pal.bold("Recent commands")));
+            ui.say(&format!(
+                "  {}\n",
+                pal.dim("Pick the steps for the new workflow; they run in the order shown.")
+            ));
+            let items: Vec<Choice> = recent
+                .iter()
+                .map(|e| Choice {
+                    title: first_line(&e.command),
+                    detail: if e.dir == store.cwd() {
+                        String::new()
+                    } else {
+                        tilde(&e.dir)
+                    },
+                })
+                .collect();
+            let mut rows = ui.select_many("Steps", &items)?;
+            rows.sort_unstable();
+            rows.into_iter().map(|r| &recent[r]).collect()
+        }
+    };
+    let Some(first) = picked.first() else {
+        ui.say("  Nothing picked.");
+        return Ok(());
+    };
+    let recording = Recording {
+        cwd: first.dir.clone(),
+        commands: picked.iter().map(|e| e.recorded()).collect(),
+        shell,
+    };
+    review(ui, store, recording, &[]).map(|_| ())
+}
+
+/// Habits in the history that are worth offering here: commands typed under this
+/// project (anywhere, outside a project) that no workflow covers yet.
+pub fn habits_here(store: &Store) -> Vec<Habit> {
+    let entries: Vec<history::Entry> = history::read(&store.dirs().history_log())
+        .into_iter()
+        .filter(|e| e.recorded().succeeded() && session::worth_recording(&e.command))
+        .collect();
+    let root = store::find_save_root(store.cwd());
+    let here: Vec<history::Entry> = entries
+        .into_iter()
+        .filter(|e| root.as_ref().is_none_or(|r| e.dir.starts_with(r)))
+        .collect();
+    let mut runs = history::sessions(&here);
+    runs.sort_by_key(|run| run[0].at);
+    let runs: Vec<Vec<&str>> = runs
+        .iter()
+        .map(|run| run.iter().map(|e| e.command.as_str()).collect())
+        .collect();
+    let known: Vec<Vec<String>> = store
+        .list()
+        .ranked
+        .iter()
+        .filter_map(|e| store::load(&e.path).ok())
+        .map(|w| w.steps)
+        .collect();
+    suggest::habits(&runs, &known)
+}
+
+/// `fr suggest`: show repeated command sequences and save one as a workflow.
+pub fn suggest(ui: &mut dyn Ui, store: &Store, shell: Dialect) -> Result<()> {
+    let _ = history::compact(&store.dirs().history_log());
+    let habits = habits_here(store);
+    let pal = ui.pal();
+    if habits.is_empty() {
+        ui.say(&format!(
+            "\n  No repeated sequences yet. {}\n",
+            pal.dim("fr notices commands you type in the same order three or more times.")
+        ));
+        return Ok(());
+    }
+    ui.say(&format!("\n  {}\n", pal.bold("You keep typing these")));
+    for (i, habit) in habits.iter().enumerate() {
+        ui.say(&format!(
+            "    {}  {}",
+            pal.cyan(&(i + 1).to_string()),
+            pal.dim(&format!("{}×", habit.times))
+        ));
+        for command in &habit.commands {
+            ui.say(&format!("       {}", first_line(command)));
+        }
+    }
+    ui.say("");
+    let answer = ui.ask("Save which?", &format!("1-{} · Enter = none", habits.len()))?;
+    let Some(habit) = answer
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .and_then(|n| n.checked_sub(1))
+        .and_then(|i| habits.get(i))
+    else {
+        return match answer.trim() {
+            "" => Ok(()),
+            other => Err(Error::invalid(format!(
+                "`{other}` is not one of the numbers"
+            ))),
+        };
+    };
+    let recording = Recording {
+        cwd: store.cwd().to_path_buf(),
+        commands: habit
+            .commands
+            .iter()
+            .map(|c| Recorded {
+                status: 0,
+                text: c.clone(),
+            })
+            .collect(),
+        shell,
+    };
+    review(ui, store, recording, &habit.varying).map(|_| ())
+}
+
+/// Walk the user through saving `recording`. `hints` are values known to change between
+/// runs; they are offered first as arguments. Returns `None` when there was nothing to save.
+pub fn review(
+    ui: &mut dyn Ui,
+    store: &Store,
+    recording: Recording,
+    hints: &[String],
+) -> Result<Option<Saved>> {
     if recording.commands.is_empty() {
         ui.say("  Nothing was recorded.");
         return Ok(None);
     }
     show_recorded(ui, &recording);
 
-    let Recording { cwd, commands } = recording;
+    let Recording {
+        cwd,
+        commands,
+        shell,
+    } = recording;
     let mut steps: Vec<String> = commands
         .into_iter()
         .filter(Recorded::succeeded)
@@ -49,11 +205,12 @@ pub fn review(ui: &mut dyn Ui, store: &Store, recording: Recording) -> Result<Op
         return Ok(None);
     }
 
-    let params = choose_dynamic(ui, &mut steps)?;
+    let params = choose_dynamic(ui, &mut steps, hints)?;
     ui.say("");
     let (name, scope, dir) = choose_destination(ui, store, &cwd, &suggest::suggest_name(&steps))?;
 
-    let workflow = Workflow::new(describe(&steps), steps, params);
+    let mut workflow = Workflow::new(describe(&steps), steps, params);
+    workflow.shell = shell;
     let path = store::write(&dir, &name, &workflow)?;
     if scope == Scope::Project {
         store.trust(&path)?; // the user just made it; no need to approve it again
@@ -106,22 +263,45 @@ fn show_recorded(ui: &mut dyn Ui, recording: &Recording) {
 
 /// Offer repeated values as parameters. Rewrites `steps` in place and returns the
 /// parameters in the order the user picked them (which is their argument order).
-fn choose_dynamic(ui: &mut dyn Ui, steps: &mut [String]) -> Result<Vec<Param>> {
-    let candidates = suggest::candidates(steps);
+fn choose_dynamic(ui: &mut dyn Ui, steps: &mut [String], hints: &[String]) -> Result<Vec<Param>> {
+    let mut candidates: Vec<Candidate> = hints
+        .iter()
+        .filter_map(|h| {
+            let used = steps
+                .iter()
+                .filter(|s| render::find_words(s, h).next().is_some())
+                .count();
+            (used > 0).then(|| Candidate {
+                value: h.clone(),
+                steps: used,
+            })
+        })
+        .collect();
+    let changed = candidates.len();
+    for c in suggest::candidates(steps) {
+        if !candidates.iter().any(|k| k.value == c.value) {
+            candidates.push(c);
+        }
+    }
     if candidates.is_empty() {
         return Ok(Vec::new());
     }
     let pal = ui.pal();
-    ui.say(&format!("\n  {}", pal.bold("Repeated values")));
+    ui.say(&format!("\n  {}", pal.bold("Values that might change")));
     ui.say(&format!(
         "  {}\n",
         pal.dim("Pick the ones to pass as arguments each time you run this. The order you pick is the argument order.")
     ));
     let items: Vec<Choice> = candidates
         .iter()
-        .map(|c| Choice {
+        .enumerate()
+        .map(|(i, c)| Choice {
             title: c.value.clone(),
-            detail: format!("used in {} steps", c.steps),
+            detail: if i < changed {
+                "changed every time you ran this".to_owned()
+            } else {
+                format!("used in {} steps", c.steps)
+            },
         })
         .collect();
     let picked = ui.select_many("Make dynamic", &items)?;
@@ -254,6 +434,7 @@ mod tests {
     fn recording(cwd: PathBuf, commands: &[(i32, &str)]) -> Recording {
         Recording {
             cwd,
+            shell: Dialect::Posix,
             commands: commands
                 .iter()
                 .map(|&(status, t)| Recorded {
@@ -293,7 +474,7 @@ mod tests {
         );
         let mut ui = Scripted::new([pick(&[0]), text(""), text("")]);
 
-        let saved = review(&mut ui, &store, rec).unwrap().unwrap();
+        let saved = review(&mut ui, &store, rec, &[]).unwrap().unwrap();
 
         assert_eq!(
             (saved.name.as_str(), saved.scope),
@@ -325,6 +506,7 @@ mod tests {
             &mut ui,
             &store,
             recording(fx.path("repo"), &[(0, "cargo test")]),
+            &[],
         )
         .unwrap()
         .unwrap();
@@ -343,17 +525,27 @@ mod tests {
         fs::create_dir_all(fx.path("repo/.git")).unwrap();
         let store = fx.store_in("repo");
         let mut ui = Scripted::new([text("mine"), text("global")]);
-        let saved = review(&mut ui, &store, recording(fx.path("repo"), &[(0, "make")]))
-            .unwrap()
-            .unwrap();
+        let saved = review(
+            &mut ui,
+            &store,
+            recording(fx.path("repo"), &[(0, "make")]),
+            &[],
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(saved.scope, Scope::Global);
         assert_eq!(saved.path, fx.path("config/workflows/mine.toml"));
 
         let plain = fx.store_in("plain");
         let mut ui = Scripted::new([text("local"), text("p")]);
-        let saved = review(&mut ui, &plain, recording(fx.path("plain"), &[(0, "make")]))
-            .unwrap()
-            .unwrap();
+        let saved = review(
+            &mut ui,
+            &plain,
+            recording(fx.path("plain"), &[(0, "make")]),
+            &[],
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             saved.path,
             fx.path("plain/.fr/workflows/local.toml"),
@@ -383,7 +575,7 @@ mod tests {
             text("g"),
         ]);
 
-        let saved = review(&mut ui, &store, rec).unwrap().unwrap();
+        let saved = review(&mut ui, &store, rec, &[]).unwrap().unwrap();
 
         assert_eq!(saved.params, ["port", "arg2"]);
         let wf = store::load(&saved.path).unwrap();
@@ -405,7 +597,7 @@ mod tests {
         let store = fx.store_in("w");
         let rec = recording(fx.path("w"), &[(0, "mkdir demo"), (0, "cd demo")]);
         let mut ui = Scripted::new([pick(&[]), text("keep"), text("")]);
-        let saved = review(&mut ui, &store, rec).unwrap().unwrap();
+        let saved = review(&mut ui, &store, rec, &[]).unwrap().unwrap();
         let wf = store::load(&saved.path).unwrap();
         assert_eq!(wf.steps, ["mkdir demo", "cd demo"]);
         assert!(wf.params.is_empty());
@@ -433,7 +625,7 @@ mod tests {
             text("n"),
             text(""),
         ]);
-        let saved = review(&mut ui, &store, rec).unwrap().unwrap();
+        let saved = review(&mut ui, &store, rec, &[]).unwrap().unwrap();
         assert_eq!(saved.params, ["x", "y"]);
         assert!(
             ui.transcript().contains("`x` is already used")
@@ -446,9 +638,14 @@ mod tests {
         let fx = Fixture::new();
         let store = fx.store_in("w");
         let mut ui = Scripted::new([text("list"), text("Bad Name"), text("good"), text("")]);
-        let saved = review(&mut ui, &store, recording(fx.path("w"), &[(0, "make")]))
-            .unwrap()
-            .unwrap();
+        let saved = review(
+            &mut ui,
+            &store,
+            recording(fx.path("w"), &[(0, "make")]),
+            &[],
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(saved.name, "good");
         assert!(ui.transcript().contains("built-in command"));
     }
@@ -461,9 +658,14 @@ mod tests {
         let before = fs::read_to_string(&original).unwrap();
         let mut ui = Scripted::new([text("a"), text(""), text("n"), text("b"), text("")]);
 
-        let saved = review(&mut ui, &store, recording(fx.path("w"), &[(0, "make")]))
-            .unwrap()
-            .unwrap();
+        let saved = review(
+            &mut ui,
+            &store,
+            recording(fx.path("w"), &[(0, "make")]),
+            &[],
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(saved.name, "b");
         assert_eq!(fs::read_to_string(&original).unwrap(), before);
@@ -477,7 +679,7 @@ mod tests {
         for answers in [vec![], vec![pick(&[])], vec![pick(&[]), text("x")]] {
             let mut ui = Scripted::new(answers);
             assert!(matches!(
-                review(&mut ui, &store, rec()),
+                review(&mut ui, &store, rec(), &[]),
                 Err(Error::Cancelled)
             ));
         }
@@ -493,23 +695,108 @@ mod tests {
             recording(fx.path("w"), &[(1, "false"), (127, "nope")]),
         ] {
             let mut ui = Scripted::new([]);
-            assert_eq!(review(&mut ui, &store, rec).unwrap(), None);
+            assert_eq!(review(&mut ui, &store, rec, &[]).unwrap(), None);
             assert!(ui.asked.is_empty());
         }
+    }
+
+    // ---- after the fact ------------------------------------------------------------------
+
+    fn write_history(fx: &Fixture, lines: &[(u32, i32, &str)]) {
+        std::fs::create_dir_all(fx.path("state")).unwrap();
+        let dir = fx.path("w");
+        let text: String = lines
+            .iter()
+            .enumerate()
+            .map(|(i, (pid, status, cmd))| {
+                format!("{i}\t{pid}\t{status}\t{}\t{cmd}\n", dir.display())
+            })
+            .collect();
+        std::fs::write(fx.path("state/history"), text).unwrap();
+    }
+
+    #[test]
+    fn save_with_a_count_takes_this_shells_last_successful_commands() {
+        let fx = Fixture::new();
+        let store = fx.store_in("w");
+        write_history(
+            &fx,
+            &[
+                (7, 0, "mkdir demo"),
+                (8, 0, "echo other shell"),
+                (7, 0, "cd demo"),
+                (7, 1, "npm tset"),
+                (7, 0, "fr list"),
+                (7, 0, "npm test"),
+            ],
+        );
+        let mut ui = Scripted::new([text("t"), text("")]);
+        save(&mut ui, &store, 7, Some(2), Dialect::Posix).unwrap();
+        let wf = store::load(&fx.path("config/workflows/t.toml")).unwrap();
+        assert_eq!(
+            wf.steps,
+            ["cd demo", "npm test"],
+            "failed and fr commands are skipped"
+        );
+    }
+
+    #[test]
+    fn save_without_a_count_offers_recent_commands_and_keeps_their_order() {
+        let fx = Fixture::new();
+        let store = fx.store_in("w");
+        write_history(&fx, &[(7, 0, "a1"), (7, 0, "b2"), (7, 0, "c3")]);
+        let mut ui = Scripted::new([pick(&[2, 0]), text("abc"), text("")]);
+        save(&mut ui, &store, 7, None, Dialect::Posix).unwrap();
+        let wf = store::load(&fx.path("config/workflows/abc.toml")).unwrap();
+        assert_eq!(
+            wf.steps,
+            ["a1", "c3"],
+            "picked out of order, saved in run order"
+        );
+    }
+
+    #[test]
+    fn suggest_offers_a_habit_with_the_changing_value_preselectable() {
+        let fx = Fixture::new();
+        let store = fx.store_in("w");
+        let mut lines = Vec::new();
+        for (pid, commit) in [
+            (1, "git commit -m one"),
+            (2, "git commit -m two"),
+            (3, "git commit -m three"),
+        ] {
+            lines.extend([
+                (pid, 0, "git add -A"),
+                (pid, 0, commit),
+                (pid, 0, "git push"),
+            ]);
+        }
+        write_history(&fx, &lines);
+        let mut ui = Scripted::new([text("1"), pick(&[0]), text("ship"), text("")]);
+        suggest(&mut ui, &store, Dialect::Posix).unwrap();
+        assert!(ui.transcript().contains("3×"));
+        let wf = store::load(&fx.path("config/workflows/ship.toml")).unwrap();
+        assert_eq!(
+            wf.steps,
+            ["git add -A", "git commit -m {{name}}", "git push"]
+        );
+        assert!(habits_here(&store).is_empty(), "now covered by a workflow");
     }
 
     #[test]
     fn finish_reads_the_log_and_always_removes_it() {
         let fx = Fixture::new();
         let store = fx.store_in("w");
-        let log = crate::session::create(&fx.path("state/sessions"), &fx.path("w")).unwrap();
+        let log = crate::session::create(&fx.path("state/sessions"), &fx.path("w"), Dialect::Posix)
+            .unwrap();
         crate::session::append(&log, 0, "make build").unwrap();
 
         finish(&mut Scripted::new([text("build"), text("")]), &store, &log).unwrap();
         assert!(fx.path("config/workflows/build.toml").exists());
         assert!(!log.exists());
 
-        let log = crate::session::create(&fx.path("state/sessions"), &fx.path("w")).unwrap();
+        let log = crate::session::create(&fx.path("state/sessions"), &fx.path("w"), Dialect::Posix)
+            .unwrap();
         crate::session::append(&log, 0, "make again").unwrap();
         assert!(finish(&mut Scripted::new([]), &store, &log).is_err());
         assert!(!log.exists(), "removed even when the user cancels");

@@ -6,7 +6,7 @@ use crate::manage::{card, param_note};
 use crate::run::{locate, Located};
 use crate::store::{self, Entry, Store};
 use crate::ui::{first_line, tilde, Ui};
-use crate::workflow::{validate_name, Param, Scope, Workflow};
+use crate::workflow::{set_optional, split_optional, validate_name, Param, Scope, Workflow};
 use crate::{render, Error, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -161,8 +161,11 @@ impl Draft {
         if self.workflow.param(new).is_some() {
             return Err(Error::invalid(format!("`{new}` already exists")));
         }
+        let dialect = self.workflow.shell;
         self.rewrite_steps(|s| {
-            render::substitute(s, |n, _| (n == old).then(|| format!("{{{{{new}}}}}")))
+            render::substitute_in(dialect, s, |n, _| {
+                (n == old).then(|| format!("{{{{{new}}}}}"))
+            })
         });
         self.workflow.params[at].name = new.to_owned();
         self.changed();
@@ -171,7 +174,35 @@ impl Draft {
 
     fn set_default(&mut self, name: &str, default: Option<String>) -> Result<()> {
         let at = self.param_index(name)?;
-        self.workflow.params[at].default = default;
+        let p = &mut self.workflow.params[at];
+        if let Some(value) = default
+            .as_deref()
+            .filter(|d| !crate::workflow::is_computed(d))
+        {
+            p.accepts(value)?;
+        }
+        p.default = default;
+        self.changed();
+        Ok(())
+    }
+
+    /// Restrict a parameter to `choices`, or lift the restriction when empty.
+    fn set_choices(&mut self, name: &str, choices: Vec<String>) -> Result<()> {
+        let at = self.param_index(name)?;
+        let mut p = self.workflow.params[at].clone();
+        p.choices = choices;
+        if let Some(default) = p
+            .default
+            .as_deref()
+            .filter(|d| !crate::workflow::is_computed(d))
+        {
+            if p.accepts(default).is_err() {
+                return Err(Error::invalid(format!(
+                    "the default `{default}` must be one of the choices — change or clear it first"
+                )));
+            }
+        }
+        self.workflow.params[at] = p;
         self.changed();
         Ok(())
     }
@@ -180,9 +211,10 @@ impl Draft {
     /// appears in.
     fn make_constant(&mut self, name: &str, value: &str) -> Result<()> {
         let at = self.param_index(name)?;
+        let dialect = self.workflow.shell;
         self.rewrite_steps(|s| {
-            render::substitute(s, |n, ctx| {
-                (n == name).then(|| render::quote(value, ctx).into_owned())
+            render::substitute_in(dialect, s, |n, ctx| {
+                (n == name).then(|| render::quote_in(dialect, value, ctx).into_owned())
             })
         });
         self.workflow.params.remove(at);
@@ -210,6 +242,15 @@ impl Draft {
     fn set_step(&mut self, at: usize, text: &str) {
         self.workflow.steps[at] = text.to_owned();
         self.changed();
+    }
+
+    /// Toggle whether a failure of step `at` stops the workflow.
+    fn toggle_optional(&mut self, at: usize) -> bool {
+        let step = &mut self.workflow.steps[at];
+        let optional = !split_optional(step).0;
+        *step = set_optional(step, optional);
+        self.changed();
+        optional
     }
 
     // ---- persistence -------------------------------------------------------------------
@@ -421,7 +462,8 @@ fn parameters_menu(ui: &mut dyn Ui, draft: &mut Draft) -> Result<()> {
         for help in [
             "add <text> [name]       make text found in the steps dynamic",
             "rename <old> <new>",
-            "default <name> [value]  set (or clear) a default",
+            "default <name> [value]  set (or clear) a default; $(command) is run each time",
+            "choices <name> [a b …]  only accept these values (none = anything)",
             "constant <name> [value] turn it back into fixed text",
         ] {
             ui.say(&format!("    {}", pal.dim(help)));
@@ -436,8 +478,9 @@ fn parameters_menu(ui: &mut dyn Ui, draft: &mut Draft) -> Result<()> {
             ["add", text, rest @ ..] => draft.add_param(text, rest.first().copied()),
             ["rename", old, new] => draft.rename_param(old, new),
             ["default", name, rest @ ..] => draft.set_default(name, (!rest.is_empty()).then(|| rest.join(" "))),
+            ["choices", name, rest @ ..] => draft.set_choices(name, rest.iter().map(|c| (*c).to_owned()).collect()),
             ["constant", name, rest @ ..] => make_constant(ui, draft, name, rest),
-            _ => Err(Error::usage("try: add <text> [name] · rename <old> <new> · default <name> [value] · constant <name>")),
+            _ => Err(Error::usage("try: add <text> [name] · rename <old> <new> · default <name> [value] · choices <name> [a b …] · constant <name>")),
         };
         recover(ui, result)?;
     }
@@ -464,16 +507,23 @@ fn steps_menu(ui: &mut dyn Ui, draft: &mut Draft) -> Result<()> {
     loop {
         ui.say(&format!("\n  {}", pal.bold("Steps")));
         for (i, step) in draft.workflow.steps.iter().enumerate() {
+            let (optional, command) = split_optional(step);
+            let tag = if optional {
+                format!("  {}", pal.dim("may fail"))
+            } else {
+                String::new()
+            };
             ui.say(&format!(
-                "    {}  {}",
+                "    {}  {}{tag}",
                 pal.dim(&format!("{:>2}", i + 1)),
-                first_line(step)
+                first_line(command)
             ));
         }
         for help in [
             "rm <n>               remove a step",
             "mv <from> <to>       reorder",
             "set <n> <command…>   replace a step's text",
+            "fail <n>             toggle: a failure is reported but the workflow continues",
         ] {
             ui.say(&format!("    {}", pal.dim(help)));
         }
@@ -504,11 +554,20 @@ fn steps_menu(ui: &mut dyn Ui, draft: &mut Draft) -> Result<()> {
                 draft.set_step(n, b);
                 Ok(())
             }
-            ("rm" | "mv" | "set", ..) => Err(Error::usage(format!(
-                "step numbers run from 1 to {count} — rm <n> · mv <from> <to> · set <n> <command…>"
+            ("fail", Some(n), _) => {
+                let note = if draft.toggle_optional(n) {
+                    "may fail: replay reports it and carries on"
+                } else {
+                    "must succeed: replay stops if it fails"
+                };
+                ui.say(&format!("  {}", pal.dim(&format!("step {}: {note}", n + 1))));
+                Ok(())
+            }
+            ("rm" | "mv" | "set" | "fail", ..) => Err(Error::usage(format!(
+                "step numbers run from 1 to {count} — rm <n> · mv <from> <to> · set <n> <command…> · fail <n>"
             ))),
             _ => Err(Error::usage(
-                "try: rm <n> · mv <from> <to> · set <n> <command…>",
+                "try: rm <n> · mv <from> <to> · set <n> <command…> · fail <n>",
             )),
         };
         recover(ui, result)?;
@@ -678,6 +737,32 @@ mod tests {
     }
 
     // ---- step operations ----------------------------------------------------------------
+
+    #[test]
+    fn choices_are_checked_against_the_default_both_ways() {
+        let fx = Fixture::new();
+        let (_, mut d) = draft_of(&fx, &workflow(&["deploy {{env}}"], &["env"]));
+        let list = |items: &[&str]| items.iter().map(|c| (*c).to_owned()).collect::<Vec<_>>();
+        d.set_choices("env", list(&["dev", "prod"])).unwrap();
+        assert!(d.set_default("env", Some("staging".into())).is_err());
+        d.set_default("env", Some("prod".into())).unwrap();
+        assert!(
+            d.set_choices("env", list(&["dev"])).is_err(),
+            "would orphan the default"
+        );
+        d.set_choices("env", vec![]).unwrap();
+        assert!(d.workflow.params[0].choices.is_empty());
+    }
+
+    #[test]
+    fn toggling_a_step_marks_and_unmarks_it_as_allowed_to_fail() {
+        let fx = Fixture::new();
+        let (_, mut d) = draft_of(&fx, &workflow(&["pnpm lint", "pnpm build"], &[]));
+        assert!(d.toggle_optional(0));
+        assert_eq!(d.workflow.steps[0], "-pnpm lint");
+        assert!(!d.toggle_optional(0));
+        assert_eq!(d.workflow.steps[0], "pnpm lint");
+    }
 
     #[test]
     fn steps_can_be_reordered_replaced_and_removed_but_never_emptied() {

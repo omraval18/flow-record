@@ -33,10 +33,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # The end-to-end tests drive real shells; zsh is preinstalled on macOS only.
-      - name: Install zsh
+      # The end-to-end tests drive real shells: zsh and bash everywhere, fish on Linux.
+      - name: Install zsh and fish
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y zsh
+        run: sudo apt-get update && sudo apt-get install -y zsh fish
       - run: cargo test --locked
 
   installer:

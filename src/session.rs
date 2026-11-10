@@ -1,10 +1,11 @@
 //! The per-shell session log written while recording.
 //!
-//! The file starts with `#<TAB><start directory>`, followed by one line per finished
+//! The file starts with `#<TAB><start directory>[<TAB>fish]`, followed by one line per finished
 //! command: `<exit status><TAB><command>`. Backslash, newline and tab are escaped so a
 //! multi-line command always occupies exactly one line. Each shell records into its own
 //! file, so simultaneous terminals never interleave.
 
+use crate::render::Dialect;
 use crate::{Error, Result};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -12,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Commands that are never worth replaying.
-const SKIPPED: &[&str] = &["fr", "exit", "logout"];
+const SKIPPED: &[&str] = &["exit", "logout"];
 
 /// Exit status of a process interrupted with Ctrl-C (a dev server stopped on purpose).
 const SIGINT_STATUS: i32 = 130;
@@ -35,6 +36,8 @@ pub struct Recording {
     /// Directory the recording started in; decides project vs. global scope.
     pub cwd: PathBuf,
     pub commands: Vec<Recorded>,
+    /// The language the commands were typed in.
+    pub shell: Dialect,
 }
 
 impl Recording {
@@ -42,11 +45,17 @@ impl Recording {
     /// everything that was recorded.
     pub fn parse(text: &str) -> Self {
         let mut lines = text.lines();
-        let cwd = lines
+        let header = lines
             .next()
             .and_then(|l| l.strip_prefix("#\t"))
-            .map(|p| PathBuf::from(unescape(p)))
-            .unwrap_or_default();
+            .unwrap_or("");
+        let (dir, shell) = header.split_once('\t').unwrap_or((header, ""));
+        let cwd = PathBuf::from(unescape(dir));
+        let shell = if shell == "fish" {
+            Dialect::Fish
+        } else {
+            Dialect::Posix
+        };
         let commands = lines
             .filter_map(|line| {
                 let (status, text) = line.split_once('\t')?;
@@ -56,7 +65,11 @@ impl Recording {
                 })
             })
             .collect();
-        Self { cwd, commands }
+        Self {
+            cwd,
+            commands,
+            shell,
+        }
     }
 
     pub fn read(path: &Path) -> Result<Self> {
@@ -67,13 +80,14 @@ impl Recording {
 }
 
 /// Create a new, empty session log in `dir` and return its path.
-pub fn create(dir: &Path, cwd: &Path) -> Result<PathBuf> {
+pub fn create(dir: &Path, cwd: &Path, shell: Dialect) -> Result<PathBuf> {
     fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
     let path = dir.join(format!("{}-{nanos}", std::process::id()));
-    let header = format!("#\t{}\n", escape(&cwd.to_string_lossy()));
+    let tag = if shell == Dialect::Fish { "\tfish" } else { "" };
+    let header = format!("#\t{}{tag}\n", escape(&cwd.to_string_lossy()));
     // `create_new` guarantees two shells can never share a file.
     let mut file = OpenOptions::new()
         .write(true)
@@ -85,11 +99,28 @@ pub fn create(dir: &Path, cwd: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Append a finished command. Returns `false` when it is not worth recording
-/// (empty input, or `fr`/`exit`/`logout` themselves).
+/// Whether a typed command belongs in a workflow. Running another workflow
+/// (`fr build`) does, so workflows compose; controlling fr itself (`fr stop`, `fr list`,
+/// `fr -n x`) does not, and neither do `exit`, `logout` or blank input.
+pub fn worth_recording(command: &str) -> bool {
+    let mut words = command.split_whitespace();
+    match words.next() {
+        None => false,
+        Some("fr") => {
+            let rest: Vec<String> = shlex::split(command)
+                .unwrap_or_default()
+                .into_iter()
+                .skip(1)
+                .collect();
+            crate::cli::is_replay(&rest)
+        }
+        Some(program) => !SKIPPED.contains(&program),
+    }
+}
+
+/// Append a finished command. Returns `false` when it is not worth recording.
 pub fn append(path: &Path, status: i32, command: &str) -> Result<bool> {
-    let program = command.split_whitespace().next().unwrap_or("");
-    if program.is_empty() || SKIPPED.contains(&program) {
+    if !worth_recording(command) {
         return Ok(false);
     }
     let mut file = OpenOptions::new()
@@ -100,7 +131,7 @@ pub fn append(path: &Path, status: i32, command: &str) -> Result<bool> {
     Ok(true)
 }
 
-fn escape(s: &str) -> String {
+pub(crate) fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -113,7 +144,7 @@ fn escape(s: &str) -> String {
     out
 }
 
-fn unescape(s: &str) -> String {
+pub(crate) fn unescape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
@@ -139,7 +170,7 @@ mod tests {
     #[test]
     fn commands_round_trip_through_the_log_unchanged() {
         let dir = tempdir().unwrap();
-        let log = create(dir.path(), Path::new("/work/my project")).unwrap();
+        let log = create(dir.path(), Path::new("/work/my project"), Dialect::Fish).unwrap();
         let commands = [
             "echo hi",
             "cat <<EOF\nline one\n\ttabbed\nEOF",
@@ -153,6 +184,7 @@ mod tests {
 
         let recording = Recording::read(&log).unwrap();
         assert_eq!(recording.cwd, Path::new("/work/my project"));
+        assert_eq!(recording.shell, Dialect::Fish);
         let texts: Vec<_> = recording.commands.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(texts, commands);
         assert_eq!(
@@ -168,7 +200,7 @@ mod tests {
     #[test]
     fn every_command_occupies_exactly_one_line() {
         let dir = tempdir().unwrap();
-        let log = create(dir.path(), Path::new("/")).unwrap();
+        let log = create(dir.path(), Path::new("/"), Dialect::Posix).unwrap();
         append(&log, 0, "a\nb\nc").unwrap();
         assert_eq!(
             fs::read_to_string(&log).unwrap().lines().count(),
@@ -180,15 +212,29 @@ mod tests {
     #[test]
     fn fr_exit_and_blank_input_are_not_recorded() {
         let dir = tempdir().unwrap();
-        let log = create(dir.path(), Path::new("/")).unwrap();
-        for skipped in ["fr", "fr list", "exit", "logout", "   ", ""] {
+        let log = create(dir.path(), Path::new("/"), Dialect::Posix).unwrap();
+        for skipped in [
+            "fr",
+            "fr list",
+            "fr stop",
+            "fr -n build",
+            "fr edit x",
+            "exit",
+            "logout",
+            "   ",
+            "",
+        ] {
             assert!(!append(&log, 0, skipped).unwrap(), "{skipped:?}");
         }
-        assert!(
-            append(&log, 0, "frobnicate").unwrap(),
-            "only the exact program name `fr` is skipped"
-        );
-        assert_eq!(Recording::read(&log).unwrap().commands.len(), 1);
+        for kept in [
+            "frobnicate",
+            "fr build",
+            "fr -g deploy prod",
+            "fr run build",
+        ] {
+            assert!(append(&log, 0, kept).unwrap(), "{kept:?}");
+        }
+        assert_eq!(Recording::read(&log).unwrap().commands.len(), 4);
     }
 
     #[test]
@@ -232,8 +278,8 @@ mod tests {
     #[test]
     fn two_logs_never_collide() {
         let dir = tempdir().unwrap();
-        let a = create(dir.path(), Path::new("/")).unwrap();
-        let b = create(dir.path(), Path::new("/")).unwrap();
+        let a = create(dir.path(), Path::new("/"), Dialect::Posix).unwrap();
+        let b = create(dir.path(), Path::new("/"), Dialect::Posix).unwrap();
         assert_ne!(a, b);
     }
 }
