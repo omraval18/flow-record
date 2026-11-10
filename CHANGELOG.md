@@ -5,6 +5,8 @@ and versions follow [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-11-11
+
 ### Added
 
 - **bash and fish support.** `fr init bash` (bash 3.2+) and `fr init fish` (fish 3.1+)
@@ -48,5 +50,6 @@ First public release.
 - Trust on first use for project workflows; typed confirmation for destructive steps.
 - Prebuilt binaries for macOS and Linux (x86_64 and arm64, glibc 2.34+) and `install.sh`.
 
-[Unreleased]: https://github.com/omraval18/flow-record/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/omraval18/flow-record/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/omraval18/flow-record/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/omraval18/flow-record/releases/tag/v0.1.1
